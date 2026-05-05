@@ -26,6 +26,25 @@ README «витрина». Папка `MiniKBP-MobilePublish` — тех. про
 
 ---
 
+## Поддержать проект
+
+<p>
+  <a href="https://www.donationalerts.com/r/meowhiks_off" target="_blank" rel="noreferrer"
+     style="display:inline-flex;align-items:center;gap:6px;padding:10px 14px;border-radius:8px;background:#ff5dc5;color:#fff;text-decoration:none;font-weight:600;">
+    Пожертвовать
+  </a>
+  <a href="https://t.me/meowhiks" target="_blank" rel="noreferrer"
+     style="display:inline-flex;align-items:center;gap:6px;padding:10px 14px;border-radius:8px;background:#229ED9;color:#fff;text-decoration:none;font-weight:600;margin-left:8px;">
+    Telegram
+  </a>
+  <a href="https://github.com/meowhiks" target="_blank" rel="noreferrer"
+     style="display:inline-flex;align-items:center;gap:6px;padding:10px 14px;border-radius:8px;background:#24292F;color:#fff;text-decoration:none;font-weight:600;margin-left:8px;">
+    GitHub
+  </a>
+</p>
+
+---
+
 ## Быстрый старт (Android)
 
 ### 1) Установка
