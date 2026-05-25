@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 public class NotificationScheduler {
     private static final String TAG = "NotificationScheduler";
     public static final String WORK_NAME_SYNC = "background_sync_work";
+    public static final String WORK_NAME_SYNC_QUICK = "background_sync_quick_once";
 
     /**
      * Планирует разовое уведомление
@@ -65,15 +66,14 @@ public class NotificationScheduler {
      * Планирует периодическую фоновую синхронизацию
      */
     public static void schedulePeriodicSync(Context context) {
-        Log.d(TAG, "Scheduling periodic background sync (every 30 minutes)");
+        Log.d(TAG, "Scheduling periodic background sync (every 15 minutes)");
 
         Data inputData = new Data.Builder().build();
 
         // Минимальный интервал для PeriodicWorkRequest - 15 минут
-        // Устанавливаем 30 минут как запрошено
         PeriodicWorkRequest syncWork = new PeriodicWorkRequest.Builder(
                 BackgroundSyncWorker.class,
-                30, TimeUnit.MINUTES
+                15, TimeUnit.MINUTES
             )
             .setInputData(inputData)
             .addTag(WORK_NAME_SYNC)
@@ -86,6 +86,26 @@ public class NotificationScheduler {
         );
 
         Log.d(TAG, "Periodic sync scheduled successfully");
+    }
+
+    /**
+     * Разовая быстрая синхронизация после закрытия приложения (через 15 секунд).
+     */
+    public static void scheduleQuickSync(Context context, int delaySeconds) {
+        Log.d(TAG, "Scheduling quick one-time sync in " + delaySeconds + "s");
+
+        Data inputData = new Data.Builder()
+            .putBoolean("force_sync", true)
+            .putBoolean("quick_demo_notifications", true)
+            .build();
+
+        OneTimeWorkRequest quickSyncWork = new OneTimeWorkRequest.Builder(BackgroundSyncWorker.class)
+            .setInputData(inputData)
+            .setInitialDelay(Math.max(0, delaySeconds), TimeUnit.SECONDS)
+            .addTag(WORK_NAME_SYNC_QUICK)
+            .build();
+
+        WorkManager.getInstance(context).enqueue(quickSyncWork);
     }
 
     /**

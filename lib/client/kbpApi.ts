@@ -1,6 +1,6 @@
 import { getKbpPairTime } from "@/lib/client/kbpBellSchedule";
 import { isNativeApp } from "@/lib/client/platform";
-import { nativeRequestText } from "@/lib/client/nativeHttp";
+import { extractCookiePairs, nativeRequestText } from "@/lib/client/nativeHttp";
 import { storageGet, storageSet } from "@/lib/client/storage";
 
 export type Group = { id: string; name: string };
@@ -147,7 +147,7 @@ export async function login(input: {
     return await res.json();
   }
 
-  // Native mode - CapacitorHttp manages cookies automatically
+  // Native mode: сохраняем cookies вручную (нужно для последующих запросов)
   const timestamp = Date.now();
   const loginPage = await nativeRequestText({
     url: `https://ej.kbp.by/templates/login_parent.php?_=${timestamp}`,
@@ -164,6 +164,8 @@ export async function login(input: {
   });
 
   const sCode = parseSCode(loginPage.data);
+  const initialCookiePairs = extractCookiePairs(loginPage.headers["set-cookie"] || loginPage.headers["setcookie"]);
+  const initialCookies = initialCookiePairs.join("; ");
 
   const formData = new URLSearchParams();
   formData.append("action", "login_parent");
@@ -185,12 +187,59 @@ export async function login(input: {
       Referer: "https://ej.kbp.by/",
       Origin: "https://ej.kbp.by",
       "X-Requested-With": "XMLHttpRequest",
+      ...(initialCookies ? { Cookie: initialCookies } : {}),
     },
     data: formDataString,
   });
 
   const isSuccess = ajax.data.toLowerCase().includes("good");
+  const ajaxCookiePairs = extractCookiePairs(ajax.headers["set-cookie"] || ajax.headers["setcookie"]);
+  const sessionCookies = (ajaxCookiePairs.length > 0 ? ajaxCookiePairs : initialCookiePairs).join("; ");
+
+  if (isSuccess && sessionCookies) {
+    await storageSet("ej_cookies", sessionCookies);
+  }
+
   return isSuccess ? { success: true } : { success: false, error: "Ошибка входа. Проверьте данные." };
+}
+
+/**
+ * Автоматическая переавторизация:
+ * читает сохранённые credentials из ej_login_data → вызывает login() → возвращает успех/провал.
+ * Используется как fallback при протухшей сессии.
+ */
+async function autoRelogin(): Promise<boolean> {
+  console.log("[KBP] Session expired, attempting auto re-login...");
+  try {
+    const loginDataRaw = await storageGet("ej_login_data");
+    if (!loginDataRaw) {
+      console.warn("[KBP] autoRelogin: no saved credentials in ej_login_data");
+      return false;
+    }
+
+    const loginData = JSON.parse(loginDataRaw) as {
+      student_name: string;
+      group_id: string;
+      birth_day: string;
+    };
+
+    if (!loginData.student_name || !loginData.group_id || !loginData.birth_day) {
+      console.warn("[KBP] autoRelogin: credentials incomplete", loginData);
+      return false;
+    }
+
+    const result = await login(loginData);
+    if (result.success) {
+      console.log("[KBP] autoRelogin: success");
+      return true;
+    }
+
+    console.warn("[KBP] autoRelogin: login() returned failure:", result.error);
+    return false;
+  } catch (err) {
+    console.error("[KBP] autoRelogin: unexpected error:", err);
+    return false;
+  }
 }
 
 // Parse FIO from parent_journal.php navbar link
@@ -198,7 +247,12 @@ export async function login(input: {
 export async function fetchStudentFIO(): Promise<{ success: boolean; fio?: string; error?: string }> {
   console.log("[KBP] Fetching student FIO from navbar...");
 
-  try {
+  /**
+   * Единый HTTP-запрос за FIO:
+   * возвращает fio-строку или null если сессия протухла / FIO не распарсился.
+   */
+  const doRequest = async (): Promise<string | null> => {
+    const cookies = await storageGet("ej_cookies");
     const r = await nativeRequestText({
       url: "https://ej.kbp.by/templates/parent_journal.php",
       method: "GET",
@@ -210,11 +264,23 @@ export async function fetchStudentFIO(): Promise<{ success: boolean; fio?: strin
         Referer: "https://ej.kbp.by/",
         "Cache-Control": "no-store, no-cache, must-revalidate",
         Pragma: "no-cache",
+        ...(cookies ? { Cookie: cookies } : {}),
       },
     });
+    return parseFioFromJournalHtml(r.data);
+  };
 
-    const html = r.data;
-    const fio = parseFioFromJournalHtml(html);
+  try {
+    let fio = await doRequest();
+
+    // Сессия протухла — пробуем переавторизоваться и повторить
+    if (!fio) {
+      const reloggedIn = await autoRelogin();
+      if (reloggedIn) {
+        fio = await doRequest();
+      }
+    }
+
     if (fio) {
       console.log("[KBP] Parsed FIO:", fio);
       await storageSet(STORAGE_KEYS.STUDENT_FIO, fio);
@@ -234,7 +300,34 @@ export async function getCachedFIO(): Promise<string | null> {
   return await storageGet(STORAGE_KEYS.STUDENT_FIO);
 }
 
+export type JournalMark = { value: string; type: string; kind?: "normal" | "alert" };
 export type JournalData = any;
+
+/** Старый кэш без поля kind — нужно перекачать журнал с сервера */
+export function journalDataNeedsKindRefresh(data: unknown): boolean {
+  const subjects = (data as { subjects?: unknown })?.subjects;
+  if (!Array.isArray(subjects)) return false;
+  for (const subject of subjects) {
+    const matrix = (subject as { gradesMatrix?: Record<string, unknown> })?.gradesMatrix;
+    if (!matrix || typeof matrix !== "object") continue;
+    for (const grades of Object.values(matrix)) {
+      if (!Array.isArray(grades) || grades.length === 0) continue;
+      for (const g of grades) {
+        if (g && typeof g === "object" && !("kind" in g)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Красный цвет для alert_m (inline — не зависит от Tailwind) */
+export function journalMarkAlertStyle(kind?: "normal" | "alert"): {
+  color?: string;
+  fontWeight?: number;
+} {
+  if (kind === "alert") return { color: "#dc2626", fontWeight: 700 };
+  return {};
+}
 
 export async function fetchJournal(): Promise<{ success: boolean; data?: JournalData; error?: string }> {
   console.log("[KBP] fetchJournal called");
@@ -248,7 +341,13 @@ export async function fetchJournal(): Promise<{ success: boolean; data?: Journal
     return await res.json();
   }
 
-  try {
+  /**
+   * Единый HTTP-запрос за журналом:
+   * возвращает распарсенный объект или null если сессия протухла / данных нет.
+   */
+  const doRequest = async (): Promise<{ html: string; parsed: any } | null> => {
+    const cookies = await storageGet("ej_cookies");
+    const cookieHeader = cookies && cookies.trim() !== "" ? cookies : undefined;
     const r = await nativeRequestText({
       url: "https://ej.kbp.by/templates/parent_journal.php",
       method: "GET",
@@ -258,27 +357,57 @@ export async function fetchJournal(): Promise<{ success: boolean; data?: Journal
         Accept: "*/*",
         "Accept-Language": "ru,en;q=0.9",
         Referer: "https://ej.kbp.by/parent_journal.php",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         "Cache-Control": "no-store, no-cache, must-revalidate",
         Pragma: "no-cache",
       },
     });
 
-    const html = r.data;
-    const isJournalAvailable = html.includes("pupilName") || html.includes("dateOfMonth") || html.includes("mark mar row");
-    if (!isJournalAvailable) {
-      console.log("[KBP] Journal not available in response");
-      return { success: false, error: "Journal not available. Session may have expired." };
+    // Восстанавливаем cookies из ответа если их не было
+    if (!cookieHeader) {
+      const recoveredPairs = extractCookiePairs(r.headers["set-cookie"] || r.headers["setcookie"]);
+      if (recoveredPairs.length > 0) {
+        await storageSet("ej_cookies", recoveredPairs.join("; "));
+      }
     }
+
+    const html = r.data;
+    const isJournalAvailable =
+      html.includes("pupilName") ||
+      html.includes("dateOfMonth") ||
+      html.includes("mark mar row");
+
+    if (!isJournalAvailable) return null;
 
     const parsed = parseJournalData(html);
-    if (!parsed.subjects || parsed.subjects.length === 0) {
-      return { success: false, error: "No journal data found" };
+    if (!parsed.subjects || parsed.subjects.length === 0) return null;
+
+    return { html, parsed };
+  };
+
+  try {
+    let result = await doRequest();
+
+    // Сессия протухла — переавторизовываемся и повторяем запрос
+    if (!result) {
+      console.log("[KBP] fetchJournal: session expired, trying re-login...");
+      const reloggedIn = await autoRelogin();
+      if (!reloggedIn) {
+        return { success: false, error: "Session expired and re-login failed" };
+      }
+      result = await doRequest();
     }
 
-    // Save to storage before returning
+    if (!result) {
+      return { success: false, error: "Journal not available after re-login" };
+    }
+
+    const { html, parsed } = result;
+
     console.log("[KBP] Saving journal data to storage");
     await storageSet(STORAGE_KEYS.JOURNAL_DATA, JSON.stringify(parsed));
     await storageSet(STORAGE_KEYS.LAST_JOURNAL_FETCH, Date.now().toString());
+
     const fio = parseFioFromJournalHtml(html);
     if (fio) {
       await storageSet(STORAGE_KEYS.STUDENT_FIO, fio);
@@ -346,7 +475,7 @@ function parseJournalData(html: string): any {
     const rowContent = rowMatch[2];
     const subjectName = subjectNames[subjectId] || `Предмет ${subjectId}`;
 
-    const gradesMatrix: Record<number, Array<{ value: string; type: string }>> = {};
+    const gradesMatrix: Record<number, JournalMark[]> = {};
     const tdMatches = Array.from(rowContent.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g));
     for (let cellIndex = 0; cellIndex < tdMatches.length; cellIndex++) {
       const cellContent = tdMatches[cellIndex][1];
@@ -360,14 +489,17 @@ function parseJournalData(html: string): any {
       const divTag = divTagMatch ? divTagMatch[0] : "";
       const titleMatch = divTag.match(/title\s*=\s*["']([^"]*)["']/);
       const title = titleMatch ? titleMatch[1].trim() : "";
+      const isAlert = /\balert_m\b/i.test(cellContent);
       const divContent = divMatch[2];
 
       if (markCount > 0 && cellIndex < data.dates.length) {
-        const markSpans = Array.from(divContent.matchAll(/<span[^>]*class="mar"[^>]*>([^<]+)<\/span>/g));
-        const cellGrades: Array<{ value: string; type: string }> = [];
+        const markSpans = Array.from(
+          divContent.matchAll(/<span[^>]*\bclass\s*=\s*["'][^"']*\bmar\b[^"']*["'][^>]*>([^<]+)<\/span>/gi)
+        );
+        const cellGrades: JournalMark[] = [];
         for (const spanMatch of markSpans) {
           const gradeValue = spanMatch[1].trim();
-          if (gradeValue) cellGrades.push({ value: gradeValue, type: title });
+          if (gradeValue) cellGrades.push({ value: gradeValue, type: title, kind: isAlert ? "alert" : "normal" });
         }
         if (cellGrades.length > 0) gradesMatrix[cellIndex] = cellGrades;
       }
@@ -452,12 +584,15 @@ export async function fetchTimetable(groupId: string): Promise<{ success: boolea
       return { success: false, error: "KBP_403" };
     }
 
-    const timetableData = parseTimetable(page.data, timetableId, userGroup.name);
+    const timetableData = parseTimetableHtml(page.data, timetableId, userGroup.name);
 
     // Save to storage before returning
     console.log("[KBP] Saving timetable data to storage");
     await storageSet(STORAGE_KEYS.TIMETABLE_DATA, JSON.stringify(timetableData));
     await storageSet(STORAGE_KEYS.LAST_TIMETABLE_FETCH, Date.now().toString());
+    // URL расписания для Java BackgroundSyncWorker (нужен чтобы фоновый воркер знал куда ходить)
+    await storageSet("cached_timetable_url",
+      `https://kbp.by/rasp/timetable/view_beta_kbp/?page=stable&cat=group&id=${timetableId}`);
 
     return { success: true, data: timetableData };
   } catch (err) {
@@ -481,7 +616,8 @@ function getPairTime(pairNumber: number, dayIndex: number): { start: string; end
   return getKbpPairTime(pairNumber, dayIndex);
 }
 
-function parseTimetable(html: string, groupId: string, groupName: string): any {
+/** Парсинг HTML расписания КБП (left_week + понедельник из right_week) */
+export function parseTimetableHtml(html: string, groupId: string, groupName: string): any {
   const data: any = {
     groupId,
     groupName,
@@ -506,47 +642,98 @@ function parseTimetable(html: string, groupId: string, groupName: string): any {
 
   const weekDays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"];
 
-  const tableMatches = Array.from(html.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi));
-  const rwIdx = html.search(/id=["']right_week["']/i);
-  const segments: { content: string; weekOffset: number }[] = [];
-  for (const match of tableMatches) {
-    const content = match[1];
-    if (!content.includes("pair-number") || !content.includes("day=")) continue;
-    const full = match[0];
-    const globalIdx = html.indexOf(full);
-    if (globalIdx < 0) continue;
-    if (segments.length === 0) {
-      segments.push({ content, weekOffset: 0 });
-      continue;
+  const extractWeekBlock = (weekId: "left_week" | "right_week"): string | null => {
+    if (weekId === "left_week") {
+      return html.match(/<div[^>]*id=["']left_week["'][^>]*>([\s\S]*?)<div[^>]*id=["']right_week["']/i)?.[1] ?? null;
     }
-    if (rwIdx >= 0 && globalIdx > rwIdx && content !== segments[0].content) {
-      segments.push({ content, weekOffset: 1 });
-      break;
-    }
-  }
-  if (segments.length === 0) return data;
+    return html.match(/<div[^>]*id=["']right_week["'][^>]*>([\s\S]*)/i)?.[1] ?? null;
+  };
 
-  data.hasNextWeek = segments.length > 1;
+  const extractScheduleTable = (weekBlock: string): string | null => {
+    const m = weekBlock.match(/<table[^>]*>([\s\S]*?)<\/table>/i);
+    const content = m?.[1];
+    return content && (content.includes("pair-number") || content.includes('day="')) ? content : null;
+  };
 
-  const tableContent = segments[0].content;
+  const parseWeekMeta = (weekBlock: string) => ({
+    dateRange: weekBlock.match(/<p[^>]*class=["']date["'][^>]*>([^<]*)<\/p>/i)?.[1]?.trim() ?? "",
+    weekLabel: weekBlock.match(/<p[^>]*class=["']today["'][^>]*>([^<]*)<\/p>/i)?.[1]?.trim() ?? "",
+  });
 
-  // Parse per-day replacement status row (Показать замены / Нету замен / empty = not updated yet)
-  const replacementRowMatch = tableContent.match(/<tr[^>]*class="[^"]*zamena[^"]*"[^>]*>([\s\S]*?)<\/tr>/i);
-  if (replacementRowMatch) {
+  const parseZamenaForDays = (tableContent: string, dayIndices: number[]) => {
+    const replacementRowMatch = tableContent.match(/<tr[^>]*class="[^"]*zamena[^"]*"[^>]*>([\s\S]*?)<\/tr>/i);
+    if (!replacementRowMatch) return;
     const replacementCells = Array.from(replacementRowMatch[1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi));
-    for (let i = 0; i < 6; i++) {
-      const content = replacementCells[i + 1]?.[1] || "";
-      const plain = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    for (let i = 0; i < dayIndices.length; i++) {
+      const storeIndex = dayIndices[i];
+      const cellContent = replacementCells[i + 1]?.[1] || "";
+      const plain = cellContent.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
       const hasChanges = /показать\s+замены/i.test(plain);
       const noChanges = /нету?\s+замен/i.test(plain);
-      data.dayReplacementStatus[i] = {
+      if (!data.dayReplacementStatus[storeIndex]) {
+        data.dayReplacementStatus[storeIndex] = { label: "", hasChanges: false, noChanges: false, unknown: true };
+      }
+      data.dayReplacementStatus[storeIndex] = {
         label: plain,
         hasChanges,
         noChanges,
         unknown: !hasChanges && !noChanges,
       };
     }
+  };
+
+  const segments: { content: string; weekOffset: number }[] = [];
+  const leftBlock = extractWeekBlock("left_week");
+  const rightBlock = extractWeekBlock("right_week");
+
+  if (leftBlock) {
+    const leftTable = extractScheduleTable(leftBlock);
+    if (leftTable) {
+      segments.push({ content: leftTable, weekOffset: 0 });
+      data.currentWeek = parseWeekMeta(leftBlock);
+      parseZamenaForDays(leftTable, [0, 1, 2, 3, 4, 5]);
+    }
   }
+
+  if (rightBlock) {
+    const rightTable = extractScheduleTable(rightBlock);
+    if (rightTable) {
+      segments.push({ content: rightTable, weekOffset: 1 });
+      data.nextWeekMonday = parseWeekMeta(rightBlock);
+      data.hasNextWeekMonday = true;
+      data.dayStartTimes.push({ start: "", end: "" });
+      data.dayReplacementStatus.push({ label: "", hasChanges: false, noChanges: false, unknown: true });
+      parseZamenaForDays(rightTable, [6]);
+    }
+  }
+
+  if (segments.length === 0) {
+    const rwIdx = html.search(/id=["']right_week["']/i);
+    const tableMatches = Array.from(html.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi));
+    for (const match of tableMatches) {
+      const content = match[1];
+      if (!content.includes("pair-number") && !content.includes('day="')) continue;
+      const full = match[0];
+      const globalIdx = html.indexOf(full);
+      if (globalIdx < 0) continue;
+      if (segments.length === 0) {
+        segments.push({ content, weekOffset: 0 });
+        continue;
+      }
+      if (rwIdx >= 0 && globalIdx > rwIdx && content !== segments[0].content) {
+        segments.push({ content, weekOffset: 1 });
+        data.hasNextWeekMonday = true;
+        data.nextWeekMonday = data.nextWeekMonday ?? { dateRange: "", weekLabel: "след. нед." };
+        data.dayStartTimes.push({ start: "", end: "" });
+        data.dayReplacementStatus.push({ label: "", hasChanges: false, noChanges: false, unknown: true });
+        break;
+      }
+    }
+  }
+
+  if (segments.length === 0) return data;
+
+  data.hasNextWeek = Boolean(data.hasNextWeekMonday);
 
   for (const seg of segments) {
     const tableContent = seg.content;
@@ -575,6 +762,9 @@ function parseTimetable(html: string, groupId: string, groupName: string): any {
         dayIndex = cellIndex - 1;
         if (dayIndex < 0 || dayIndex > 5) continue;
       }
+
+      // right_week: только понедельник (колонка после субботы текущей недели)
+      if (weekOffset === 1 && dayIndex !== 0) continue;
 
       if (cellContent.includes("empty-pair") && !cellContent.includes("pair")) continue;
 
@@ -766,6 +956,7 @@ function parseTimetable(html: string, groupId: string, groupName: string): any {
 
         if (pairData.subject) {
           pairData.weekOffset = weekOffset;
+          if (weekOffset === 1) pairData.isNextWeekMonday = true;
           data.pairs.push(pairData);
         }
         pairStartIndex = pairEndPos + 6;
@@ -775,8 +966,18 @@ function parseTimetable(html: string, groupId: string, groupName: string): any {
 
   }
 
+  const fillDayRange = (dayIndex: number, filter: (p: any) => boolean) => {
+    const dayPairs = data.pairs.filter(filter);
+    if (dayPairs.length === 0) return;
+    const firstPair = dayPairs.reduce((min: any, p: any) => (p.pairNumber < min.pairNumber ? p : min), dayPairs[0]);
+    const lastPair = dayPairs.reduce((max: any, p: any) => (p.pairNumber > max.pairNumber ? p : max), dayPairs[0]);
+    const firstTime = getPairTime(firstPair.pairNumber, dayIndex === 6 ? 0 : dayIndex);
+    const lastTime = getPairTime(lastPair.pairNumber, dayIndex === 6 ? 0 : dayIndex);
+    data.dayStartTimes[dayIndex] = { start: firstTime.start, end: lastTime.end };
+  };
+
   for (let dayIndex = 0; dayIndex < 6; dayIndex++) {
-    const dayPairs = data.pairs.filter((p: any) => {
+    fillDayRange(dayIndex, (p: any) => {
       if ((p.weekOffset ?? 0) !== 0) return false;
       if (p.day !== dayIndex) return false;
       const subjectTrimmed = (p.subject || "").trim();
@@ -784,13 +985,16 @@ function parseTimetable(html: string, groupId: string, groupName: string): any {
       if (p.status === "removed" || p.status === "cancelled") return false;
       return p.status === "added" || p.status === "normal" || p.status === "replaced" || !p.status;
     });
-    if (dayPairs.length > 0) {
-      const firstPair = dayPairs.reduce((min: any, p: any) => (p.pairNumber < min.pairNumber ? p : min), dayPairs[0]);
-      const lastPair = dayPairs.reduce((max: any, p: any) => (p.pairNumber > max.pairNumber ? p : max), dayPairs[0]);
-      const firstTime = getPairTime(firstPair.pairNumber, dayIndex);
-      const lastTime = getPairTime(lastPair.pairNumber, dayIndex);
-      data.dayStartTimes[dayIndex] = { start: firstTime.start, end: lastTime.end };
-    }
+  }
+
+  if (data.hasNextWeekMonday) {
+    fillDayRange(6, (p: any) => {
+      if ((p.weekOffset ?? 0) !== 1 || p.day !== 0) return false;
+      const subjectTrimmed = (p.subject || "").trim();
+      if (!subjectTrimmed || subjectTrimmed === "Урок снят") return false;
+      if (p.status === "removed" || p.status === "cancelled") return false;
+      return p.status === "added" || p.status === "normal" || p.status === "replaced" || !p.status;
+    });
   }
 
   return data;

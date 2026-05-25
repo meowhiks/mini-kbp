@@ -52,7 +52,7 @@ public class NotificationPlugin extends Plugin {
 
     @PluginMethod
     public void startPeriodicSync(com.getcapacitor.PluginCall call) {
-        Log.d(TAG, "Starting periodic sync (30 minutes interval)");
+        Log.d(TAG, "Starting periodic sync (15 minutes interval)");
 
         try {
             NotificationScheduler.schedulePeriodicSync(getContext());
@@ -61,6 +61,20 @@ public class NotificationPlugin extends Plugin {
         } catch (Exception e) {
             Log.e(TAG, "Failed to start periodic sync", e);
             call.reject("Failed to start periodic sync: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void scheduleQuickSync(com.getcapacitor.PluginCall call) {
+        int delaySeconds = call.getInt("delaySeconds", 15);
+        Log.d(TAG, "Scheduling quick one-time sync in " + delaySeconds + "s");
+
+        try {
+            NotificationScheduler.scheduleQuickSync(getContext(), delaySeconds);
+            call.resolve();
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to schedule quick sync", e);
+            call.reject("Failed to schedule quick sync: " + e.getMessage());
         }
     }
 
@@ -119,8 +133,7 @@ public class NotificationPlugin extends Plugin {
         }
 
         if (PermissionHelper.isNotificationPermissionRequired()) {
-            bridge.saveCall(call);
-            PermissionHelper.requestNotificationPermission(this.getActivity());
+            requestPermissionForAlias("notifications", call, "notificationPermissionCallback");
         } else {
             call.resolve();
         }

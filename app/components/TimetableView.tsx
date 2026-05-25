@@ -1,7 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getKbpPairTime } from "@/lib/client/kbpBellSchedule";
+import {
+  getTimetableDayCount,
+  getTimetableDayLabels,
+  getTimetableDayShortLabels,
+  normalizeTimetableData,
+  pairMatchesDisplayDay,
+  TIMETABLE_SLOT_NEXT_MONDAY,
+} from "@/lib/client/timetableDisplay";
 
 interface Pair {
   pairNumber: number;
@@ -33,6 +41,8 @@ interface TimetableViewProps {
   hideTeacherRoom?: boolean;
   /** Не показывать номер пары слева */
   hidePairNumbers?: boolean;
+  /** Полоска быстрого выбора дня (Пн–Сб, след. понедельник) */
+  showDayStrip?: boolean;
 }
 
 export default function TimetableView({
@@ -45,19 +55,15 @@ export default function TimetableView({
   density,
   hideTeacherRoom = false,
   hidePairNumbers = false,
+  showDayStrip = false,
 }: TimetableViewProps) {
   const defaultReplacement = defaultShowReplacements ?? true;
   const densityMode: "normal" | "compact" | "small" = density ?? "normal";
 
   const [showReplacementsDays, setShowReplacementsDays] = useState<boolean[]>(() =>
-    Array(6).fill(defaultReplacement)
+    Array(7).fill(defaultReplacement)
   );
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
-  const [swipeArrow, setSwipeArrow] = useState<"left" | "right" | null>(null);
-  const swipeArrowTimerRef = useRef<number | null>(null);
-  const [timetableWeekOffset, setTimetableWeekOffset] = useState(0);
-
-  const weekDays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"];
   const today = new Date().getDay();
   const currentDayIndex = today === 0 ? 6 : today - 1;
   const initialDayIndex = currentDayIndex >= 0 && currentDayIndex <= 5 ? currentDayIndex : 0;
@@ -76,9 +82,16 @@ export default function TimetableView({
     setVisibleDayIndex(initialDayIndex);
   }, [initialDayIndex]);
 
+  const timetable = useMemo(() => normalizeTimetableData(data), [data]);
+  const hasData = Boolean(timetable?.pairs?.length);
+  const weekDays = useMemo(() => (hasData ? getTimetableDayLabels(timetable) : []), [timetable, hasData]);
+  const dayShortLabels = useMemo(() => (hasData ? getTimetableDayShortLabels(timetable) : []), [timetable, hasData]);
+  const dayCount = hasData ? getTimetableDayCount(timetable) : 6;
+  const maxDayIndex = dayCount - 1;
+
   useEffect(() => {
-    setTimetableWeekOffset(0);
-  }, [data]);
+    setVisibleDayIndex((prev) => Math.min(prev, maxDayIndex));
+  }, [maxDayIndex, hasData]);
 
   useEffect(() => {
     if (prevDayRef.current === visibleDayIndex) return;
@@ -90,20 +103,24 @@ export default function TimetableView({
 
   // Set replacement toggle defaults based on parsed "замены" row.
   useEffect(() => {
-    const statuses = data?.dayReplacementStatus;
+    const statuses = timetable?.dayReplacementStatus;
     if (!Array.isArray(statuses) || statuses.length < 6) return;
 
-    setShowReplacementsDays((prev) =>
-      prev.map((_, idx) => {
+    setShowReplacementsDays((prev) => {
+      const len = Math.max(7, statuses.length);
+      return Array.from({ length: len }, (_, idx) => {
         const info = statuses[idx];
         if (info?.hasChanges) return defaultReplacement;
         if (info?.noChanges) return false;
-        return defaultReplacement;
-      })
-    );
-  }, [data?.dayReplacementStatus, defaultReplacement]);
+        return prev[idx] ?? defaultReplacement;
+      });
+    });
+  }, [timetable?.dayReplacementStatus, defaultReplacement]);
 
-  if (!data || !data.pairs) {
+  const goPrevDay = () => setVisibleDayIndex((prev) => Math.max(0, prev - 1));
+  const goNextDay = () => setVisibleDayIndex((prev) => Math.min(maxDayIndex, prev + 1));
+
+  if (!hasData) {
     return (
       <div className="text-center py-12 text-gray-500 dark:text-zinc-400">
         <p>Нет данных для отображения</p>
@@ -111,9 +128,8 @@ export default function TimetableView({
     );
   }
 
-  const visibleDayName = weekDays[visibleDayIndex];
-  const visibleIsToday = timetableWeekOffset === 0 && visibleDayIndex === currentDayIndex;
-  const hasNextWeek = Boolean(data.hasNextWeek);
+  const visibleDayName = weekDays[visibleDayIndex] ?? weekDays[0];
+  const visibleIsToday = visibleDayIndex === currentDayIndex;
 
   const dayHeaderPadding =
     densityMode === "small" ? "px-2 py-2" : densityMode === "compact" ? "px-3 py-2" : "px-4 py-3";
@@ -146,8 +162,9 @@ export default function TimetableView({
     return d.getHours() * 60 + d.getMinutes();
   })();
 
-  const isLiveCalendarDay = (dayIndex: number) =>
-    timetableWeekOffset === 0 && dayIndex === currentDayIndex;
+  const isLiveCalendarDay = (dayIndex: number) => dayIndex === currentDayIndex;
+
+  const bellDayIndex = (dayIndex: number) => (dayIndex === TIMETABLE_SLOT_NEXT_MONDAY ? 0 : dayIndex);
 
   const getNowHighlightedPairNumber = (dayIndex: number, pairs: Pair[]): number | null => {
     if (!isLiveCalendarDay(dayIndex)) return null;
@@ -155,7 +172,7 @@ export default function TimetableView({
 
     // 1) exact current pair
     for (const p of pairs) {
-      const { start, end } = getKbpPairTime(p.pairNumber, dayIndex);
+      const { start, end } = getKbpPairTime(p.pairNumber, bellDayIndex(dayIndex));
       const s = timeToMinutes(start);
       const e = timeToMinutes(end);
       if (s === null || e === null) continue;
@@ -178,7 +195,7 @@ export default function TimetableView({
 
   const getCountdownParen = (pairNumber: number, dayIndex: number): string | null => {
     if (!countdownEnabled || !isLiveCalendarDay(dayIndex)) return null;
-    const { start, end } = getKbpPairTime(pairNumber, dayIndex);
+    const { start, end } = getKbpPairTime(pairNumber, bellDayIndex(dayIndex));
     const sMin = timeToMinutes(start);
     const eMin = timeToMinutes(end);
     if (sMin === null || eMin === null) return null;
@@ -203,7 +220,7 @@ export default function TimetableView({
     // nearest upcoming pair
     let best: { pairNumber: number; start: number } | null = null;
     for (const p of pairs) {
-      const { start } = getKbpPairTime(p.pairNumber, dayIndex);
+      const { start } = getKbpPairTime(p.pairNumber, bellDayIndex(dayIndex));
       const s = timeToMinutes(start);
       if (s === null) continue;
       if (s > nowMinutes && (!best || s < best.start)) best = { pairNumber: p.pairNumber, start: s };
@@ -213,9 +230,8 @@ export default function TimetableView({
 
   const getPairsForDay = (dayIndex: number): Pair[] => {
     const showReplacements = showReplacementsDays[dayIndex];
-    const dayPairs = data.pairs
-      .filter((p: Pair) => (p.weekOffset ?? 0) === timetableWeekOffset)
-      .filter((p: Pair) => p.day === dayIndex)
+    const dayPairs = timetable.pairs
+      .filter((p: Pair) => pairMatchesDisplayDay(p, dayIndex))
       .filter((p: Pair) => {
         if (showReplacements) return p.status === "added" || p.status === "replaced" || p.status === "normal" || !p.status;
         return p.status === "removed" || p.status === "cancelled" || p.status === "replaced" || p.status === "normal" || !p.status;
@@ -285,63 +301,74 @@ export default function TimetableView({
               {title && <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100">{title}</h2>}
               {subtitle && <p className="text-sm text-gray-500 dark:text-zinc-400">{subtitle}</p>}
             </div>
-            <div className="text-right">
-              <div className={`text-[11px] font-semibold ${visibleIsToday ? "text-blue-700 dark:text-blue-300" : "text-gray-700 dark:text-zinc-200"}`}>
-                {visibleDayName}
+            {!showDayStrip ? (
+              <div className="text-right">
+                <div className={`text-[11px] font-semibold ${visibleIsToday ? "text-blue-700 dark:text-blue-300" : "text-gray-700 dark:text-zinc-200"}`}>
+                  {visibleDayName}
+                </div>
               </div>
-            </div>
+            ) : null}
           </div>
         </div>
       )}
 
+      {showDayStrip ? (
+      <div className="px-2 pt-2 pb-1 flex items-center gap-1">
+        <button
+          type="button"
+          onClick={goPrevDay}
+          disabled={visibleDayIndex <= 0}
+          className="shrink-0 w-8 h-8 rounded-lg border border-gray-200 dark:border-zinc-600 text-gray-700 dark:text-zinc-200 disabled:opacity-30"
+          aria-label="Предыдущий день"
+        >
+          ‹
+        </button>
+        <div className="flex-1 flex gap-1 overflow-x-auto pb-0.5">
+          {dayShortLabels.map((label, idx) => {
+            const active = visibleDayIndex === idx;
+            return (
+              <button
+                key={idx}
+                type="button"
+                onClick={() => setVisibleDayIndex(idx)}
+                className={`shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border ${
+                  active
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "bg-white text-gray-700 border-gray-200 dark:bg-zinc-800 dark:text-zinc-200 dark:border-zinc-600"
+                }`}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={goNextDay}
+          disabled={visibleDayIndex >= maxDayIndex}
+          className="shrink-0 w-8 h-8 rounded-lg border border-gray-200 dark:border-zinc-600 text-gray-700 dark:text-zinc-200 disabled:opacity-30"
+          aria-label="Следующий день"
+        >
+          ›
+        </button>
+      </div>
+      ) : null}
+
       {/* Single day view with horizontal swipe */}
-      <div className="space-y-3 px-1 pt-2">
-        {hasNextWeek && (
-          <div className="flex justify-center px-2 pb-1">
-            <div className="inline-flex rounded-full border border-gray-200 bg-gray-100 p-0.5 text-[12px] font-semibold dark:border-zinc-700 dark:bg-zinc-900">
-              <button
-                type="button"
-                onClick={() => setTimetableWeekOffset(0)}
-                className={`rounded-full px-3 py-1.5 transition-colors ${
-                  timetableWeekOffset === 0
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100"
-                    : "text-gray-600 dark:text-zinc-400"
-                }`}
-              >
-                Эта неделя
-              </button>
-              <button
-                type="button"
-                onClick={() => setTimetableWeekOffset(1)}
-                className={`rounded-full px-3 py-1.5 transition-colors ${
-                  timetableWeekOffset === 1
-                    ? "bg-white text-gray-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100"
-                    : "text-gray-600 dark:text-zinc-400"
-                }`}
-              >
-                Следующая
-              </button>
-            </div>
-          </div>
-        )}
+      <div className="space-y-3 px-1 pt-1">
         {(() => {
           const dayIndex = visibleDayIndex;
           const day = weekDays[dayIndex];
           const pairs = getPairsForDay(dayIndex);
-          const showTodayChrome = timetableWeekOffset === 0 && dayIndex === currentDayIndex;
+          const showTodayChrome = dayIndex === currentDayIndex;
           const showReplacements = showReplacementsDays[dayIndex];
           const highlightedPairNumber = getNowHighlightedPairNumber(dayIndex, pairs);
           const nextHighlightedPairNumber = getNextHighlightedPairNumber(dayIndex, pairs);
-          const replacementInfo = data?.dayReplacementStatus?.[dayIndex];
-          const replacementLabel = replacementInfo?.label?.trim()
-            ? replacementInfo.label
-            : replacementInfo?.unknown
-            ? "Информация о заменах еще не обновлена"
-            : "";
-          const dayRange = data?.dayStartTimes?.[dayIndex];
-          const dayPairsForRange = (data?.pairs || [])
-            .filter((p: Pair) => (p.weekOffset ?? 0) === timetableWeekOffset)
-            .filter((p: Pair) => p.day === dayIndex)
+          const replacementInfo = timetable?.dayReplacementStatus?.[dayIndex];
+          const replacementLabel = replacementInfo?.label?.trim() || "";
+          const dayRange = timetable?.dayStartTimes?.[dayIndex];
+          const dayPairsForRange = (timetable?.pairs || [])
+            .filter((p: Pair) => pairMatchesDisplayDay(p, dayIndex))
             .filter((p: Pair) => {
               const subjectTrimmed = (p.subject || "").trim();
               if (!subjectTrimmed || subjectTrimmed === "Урок снят") return false;
@@ -349,9 +376,11 @@ export default function TimetableView({
               return true;
             })
             .sort((a: Pair, b: Pair) => a.pairNumber - b.pairNumber);
-          const fallbackStart = dayPairsForRange[0] ? getKbpPairTime(dayPairsForRange[0].pairNumber, dayIndex).start : "";
+          const fallbackStart = dayPairsForRange[0]
+            ? getKbpPairTime(dayPairsForRange[0].pairNumber, bellDayIndex(dayIndex)).start
+            : "";
           const fallbackEnd = dayPairsForRange[dayPairsForRange.length - 1]
-            ? getKbpPairTime(dayPairsForRange[dayPairsForRange.length - 1].pairNumber, dayIndex).end
+            ? getKbpPairTime(dayPairsForRange[dayPairsForRange.length - 1].pairNumber, bellDayIndex(dayIndex)).end
             : "";
           const dayRangeText =
             dayRange?.start && dayRange?.end
@@ -363,10 +392,12 @@ export default function TimetableView({
           return (
             <div
               key={day}
-              className={`relative bg-white dark:bg-zinc-900 rounded-[1px] overflow-hidden border border-transparent dark:border-zinc-700 ${
+              className={`relative bg-white dark:bg-zinc-900 rounded-[1px] overflow-visible border border-transparent dark:border-zinc-700 ${
                 showTodayChrome ? "ring-2 ring-blue-300" : ""
               }`}
+              style={{ touchAction: "pan-y" }}
               onTouchStart={(e) => {
+                e.stopPropagation();
                 const t = e.touches[0];
                 if (!t) return;
                 touchStartRef.current = { x: t.clientX, y: t.clientY };
@@ -375,6 +406,7 @@ export default function TimetableView({
                 touchStartRef.current = null;
               }}
               onTouchEnd={(e) => {
+                e.stopPropagation();
                 const start = touchStartRef.current;
                 touchStartRef.current = null;
                 if (!start) return;
@@ -382,47 +414,27 @@ export default function TimetableView({
                 if (!t) return;
                 const dx = t.clientX - start.x;
                 const dy = t.clientY - start.y;
-                const threshold = Math.max(48, Math.round(window.innerWidth * 0.12));
+                const threshold = Math.max(40, Math.round(window.innerWidth * 0.1));
                 if (Math.abs(dx) < threshold) return;
-                if (Math.abs(dy) >= Math.abs(dx) * 0.85) return;
-                if (dx < 0) {
-                  setSwipeArrow("left");
-                  if (swipeArrowTimerRef.current) window.clearTimeout(swipeArrowTimerRef.current);
-                  swipeArrowTimerRef.current = window.setTimeout(() => setSwipeArrow(null), 650);
-                  setVisibleDayIndex((prev) => Math.min(5, prev + 1));
-                } else {
-                  setSwipeArrow("right");
-                  if (swipeArrowTimerRef.current) window.clearTimeout(swipeArrowTimerRef.current);
-                  swipeArrowTimerRef.current = window.setTimeout(() => setSwipeArrow(null), 650);
-                  setVisibleDayIndex((prev) => Math.max(0, prev - 1));
-                }
+                if (Math.abs(dy) > Math.abs(dx) * 0.75) return;
+                if (dx < 0) goNextDay();
+                else goPrevDay();
               }}
             >
-              {swipeArrow && (
-                <div className="pointer-events-none absolute top-3 left-0 right-0 flex items-start justify-center z-20">
-                  <div className="rounded-full bg-black/30 backdrop-blur px-3 py-2">
-                    {swipeArrow === "left" ? (
-                      <svg className="w-5 h-5 text-blue-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M15 18l-6-6 6-6" />
-                      </svg>
-                    ) : (
-                      <svg className="w-5 h-5 text-blue-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M9 18l6-6-6-6" />
-                      </svg>
-                    )}
-                  </div>
-                </div>
-              )}
-              <div className={dayAnim}>
+              <div className={dayAnim} style={{ willChange: "transform" }}>
               {/* Day Header */}
               <div className={`${dayHeaderPadding} font-semibold flex items-center justify-between ${
-                showTodayChrome ? "bg-blue-50 text-blue-900 dark:bg-blue-900/35 dark:text-blue-200" : "bg-gray-100 text-gray-800 dark:bg-zinc-800 dark:text-zinc-100"
+                showTodayChrome
+                  ? "bg-blue-50 text-blue-900 dark:bg-blue-900/35 dark:text-blue-200"
+                  : "bg-gray-100 text-gray-800 dark:bg-zinc-800 dark:text-zinc-100"
               }`}>
                 <div>
-                  <span>{day}</span>
+                  {!showDayStrip ? <span>{day}</span> : null}
+                  {replacementLabel ? (
                   <div className="text-[11px] text-blue-700 dark:text-blue-300/80 font-medium">
                     {replacementLabel}
                   </div>
+                  ) : null}
                   {replacementInfo?.hasChanges && (
                     <label className="inline-flex items-center gap-1 mt-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer">
                       <input
@@ -493,7 +505,7 @@ export default function TimetableView({
                         <div className={hidePairNumbers ? "min-w-0 flex-1" : ""}>
                           <div className="text-[11px] font-semibold text-gray-700 dark:text-zinc-300">
                             {(() => {
-                              const pairTime = getKbpPairTime(pair.pairNumber, dayIndex);
+                              const pairTime = getKbpPairTime(pair.pairNumber, bellDayIndex(dayIndex));
                               const range =
                                 pairTime.start && pairTime.end
                                   ? `${formatBellClock(pairTime.start)} - ${formatBellClock(pairTime.end)}`

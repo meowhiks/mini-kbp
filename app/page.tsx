@@ -6,7 +6,23 @@ import { themeAppShell, themeIsDark, themePageBg, type AppTheme } from "@/lib/cl
 import TimetableSearchCompact from "./components/TimetableSearchCompact";
 import TimetableView from "./components/TimetableView";
 import LoadingScreen from "./components/LoadingScreen";
-import { getGroups, login, fetchJournal, fetchTimetable, fetchStudentFIO, getCachedFIO, type Group } from "@/lib/client/kbpApi";
+import {
+  getGroups,
+  login,
+  fetchJournal,
+  fetchTimetable,
+  fetchStudentFIO,
+  getCachedFIO,
+  journalDataNeedsKindRefresh,
+  journalMarkAlertStyle,
+  type Group,
+} from "@/lib/client/kbpApi";
+import { normalizeTimetableData } from "@/lib/client/timetableDisplay";
+import {
+  calcSubjectAverageFromMarks,
+  calcTotalAverageFromSubjects,
+  formatComputedAverage,
+} from "@/lib/client/journalAverage";
 import { fetchTimetableByCategory, listTimetableEntities, type SearchResult } from "@/lib/client/searchApi";
 import { storageGet, storageRemove, storageSet } from "@/lib/client/storage";
 import { requestNotificationPermissions, scheduleQuickSyncOnClose } from "@/lib/client/notifications";
@@ -19,6 +35,22 @@ type LoginHistoryItem = {
   groupName: string;
   at: number;
 };
+
+function loginHistoryKey(item: { surname: string; date: string; group: string }): string {
+  return `${item.surname.trim().toLowerCase()}|${item.date}|${item.group}`;
+}
+
+function dedupeLoginHistory(items: LoginHistoryItem[]): LoginHistoryItem[] {
+  const byKey = new Map<string, LoginHistoryItem>();
+  for (const it of items) {
+    const key = loginHistoryKey(it);
+    const prev = byKey.get(key);
+    if (!prev || it.at > prev.at) {
+      byKey.set(key, { ...it, id: key });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => b.at - a.at);
+}
 
 type JournalEntry = {
   id: string;
@@ -63,8 +95,11 @@ export default function MainPage() {
   const [timetableDensity, setTimetableDensity] = useState<"normal" | "compact" | "small">("normal");
   const [journalShowAverage, setJournalShowAverage] = useState(true);
   const [journalDenseCells, setJournalDenseCells] = useState(false);
+  const [journalShowHundredths, setJournalShowHundredths] = useState(false);
+  const [journalShowTotal, setJournalShowTotal] = useState(true);
   const [timetableHideTeacherRoom, setTimetableHideTeacherRoom] = useState(false);
   const [timetableHidePairNumbers, setTimetableHidePairNumbers] = useState(false);
+  const [timetableDayStrip, setTimetableDayStrip] = useState(false);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
 
   const isDark = themeIsDark(theme);
@@ -139,14 +174,17 @@ export default function MainPage() {
             }
             if (typeof s?.journalShowAverage === "boolean") setJournalShowAverage(s.journalShowAverage);
             if (typeof s?.journalDenseCells === "boolean") setJournalDenseCells(s.journalDenseCells);
+            if (typeof s?.journalShowHundredths === "boolean") setJournalShowHundredths(s.journalShowHundredths);
+            if (typeof s?.journalShowTotal === "boolean") setJournalShowTotal(s.journalShowTotal);
             if (typeof s?.timetableHideTeacherRoom === "boolean") setTimetableHideTeacherRoom(s.timetableHideTeacherRoom);
             if (typeof s?.timetableHidePairNumbers === "boolean") setTimetableHidePairNumbers(s.timetableHidePairNumbers);
+            if (typeof s?.timetableDayStrip === "boolean") setTimetableDayStrip(s.timetableDayStrip);
           } catch {}
         }
 
         if (savedTimetable) {
           try {
-            setSelectedTimetable(JSON.parse(savedTimetable));
+            setSelectedTimetable(normalizeTimetableData(JSON.parse(savedTimetable)));
           } catch {}
         }
         if (savedSelectedResult) {
@@ -166,7 +204,11 @@ export default function MainPage() {
           try {
             const parsed = JSON.parse(savedLoginHistory);
             if (Array.isArray(parsed)) {
-              setLoginHistory(parsed.filter((it) => it?.id && it?.surname));
+              setLoginHistory(
+                dedupeLoginHistory(
+                  parsed.filter((it) => it?.surname && it?.date && it?.group) as LoginHistoryItem[]
+                )
+              );
             }
           } catch {}
         }
@@ -186,7 +228,9 @@ export default function MainPage() {
           setIsLoggedIn(true);
           if (savedJournal) {
             const parsedJournal = JSON.parse(savedJournal);
-            setJournalData(parsedJournal);
+            if (!journalDataNeedsKindRefresh(parsedJournal)) {
+              setJournalData(parsedJournal);
+            }
             if (!savedJournalEntries) {
               try {
                 const loginParsed = JSON.parse(savedLoginData);
@@ -208,7 +252,7 @@ export default function MainPage() {
           if (!savedTimetable && savedGroupId) {
             // No cached timetable yet -> fetch automatically
             const tr = await fetchTimetable(savedGroupId);
-            if (tr.success && tr.data) setSelectedTimetable(tr.data);
+            if (tr.success && tr.data) setSelectedTimetable(normalizeTimetableData(tr.data));
           }
         }
       } catch (err) {
@@ -238,8 +282,11 @@ export default function MainPage() {
           timetableDensity,
           journalShowAverage,
           journalDenseCells,
+          journalShowHundredths,
+          journalShowTotal,
           timetableHideTeacherRoom,
           timetableHidePairNumbers,
+          timetableDayStrip,
         })
       );
     }
@@ -253,8 +300,11 @@ export default function MainPage() {
     timetableDensity,
     journalShowAverage,
     journalDenseCells,
+    journalShowHundredths,
+    journalShowTotal,
     timetableHideTeacherRoom,
     timetableHidePairNumbers,
+    timetableDayStrip,
     settingsHydrated,
   ]);
 
@@ -429,11 +479,11 @@ export default function MainPage() {
           ]);
         }
         if (timetableResult.success && timetableResult.data) {
-          setSelectedTimetable(timetableResult.data);
+          setSelectedTimetable(normalizeTimetableData(timetableResult.data));
           const groupName = groups.find((g) => g.id === group)?.name || `Группа ${group}`;
           const selected = { id: group, name: groupName, type: "group", typeLabel: "" } as SearchResult;
           setSelectedResult(selected);
-          await storageSet("cached_timetable_data", JSON.stringify(timetableResult.data));
+          await storageSet("cached_timetable_data", JSON.stringify(normalizeTimetableData(timetableResult.data)));
           await storageSet("cached_selected_timetable_result", JSON.stringify(selected));
           setKbpNotice("");
         } else if (String(timetableResult.error || "").includes("KBP_403")) {
@@ -444,16 +494,16 @@ export default function MainPage() {
         }
 
         const groupName = groups.find((g) => g.id === group)?.name || group;
+        const historyEntry = {
+          surname,
+          date: formattedDate,
+          group,
+          groupName,
+        };
+        const historyKey = loginHistoryKey(historyEntry);
         setLoginHistory((prev) => [
-          {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            surname,
-            date: formattedDate,
-            group,
-            groupName,
-            at: Date.now(),
-          },
-          ...prev,
+          { id: historyKey, ...historyEntry, at: Date.now() },
+          ...prev.filter((x) => loginHistoryKey(x) !== historyKey),
         ]);
 
         if (!journalResult.success) {
@@ -476,8 +526,8 @@ export default function MainPage() {
 
   const handleTimetableSelect = (result: SearchResult, data: any) => {
     setSelectedResult(result);
-    setSelectedTimetable(data);
-    storageSet("cached_timetable_data", JSON.stringify(data));
+    setSelectedTimetable(normalizeTimetableData(data));
+    storageSet("cached_timetable_data", JSON.stringify(normalizeTimetableData(data)));
     storageSet("cached_selected_timetable_result", JSON.stringify(result));
   };
 
@@ -508,7 +558,7 @@ export default function MainPage() {
     const timetableResult = await fetchTimetableByCategory(type, resolvedId);
     if (timetableResult.success && timetableResult.data) {
       setSelectedResult(result);
-      setSelectedTimetable(timetableResult.data);
+      setSelectedTimetable(normalizeTimetableData(timetableResult.data));
       await storageSet("cached_timetable_data", JSON.stringify(timetableResult.data));
       await storageSet("cached_selected_timetable_result", JSON.stringify(result));
       setCurrentPage(1);
@@ -533,8 +583,8 @@ export default function MainPage() {
         if (cancelled) return;
 
         if (timetableResult.success && timetableResult.data) {
-          setSelectedTimetable(timetableResult.data);
-          await storageSet("cached_timetable_data", JSON.stringify(timetableResult.data));
+          setSelectedTimetable(normalizeTimetableData(timetableResult.data));
+          await storageSet("cached_timetable_data", JSON.stringify(normalizeTimetableData(timetableResult.data)));
           setKbpNotice("");
         } else if (String(timetableResult.error || "").includes("KBP_403")) {
           setKbpNotice("Ошибка со стороны kbp.by (403). Показаны локальные данные.");
@@ -620,8 +670,8 @@ export default function MainPage() {
 
         if (cancelled) return;
         if (timetableResult.success && timetableResult.data) {
-          setSelectedTimetable(timetableResult.data);
-          await storageSet("cached_timetable_data", JSON.stringify(timetableResult.data));
+          setSelectedTimetable(normalizeTimetableData(timetableResult.data));
+          await storageSet("cached_timetable_data", JSON.stringify(normalizeTimetableData(timetableResult.data)));
           setKbpNotice("");
         }
 
@@ -742,10 +792,16 @@ export default function MainPage() {
               onJournalShowAverageChange={setJournalShowAverage}
               journalDenseCells={journalDenseCells}
               onJournalDenseCellsChange={setJournalDenseCells}
+              journalShowHundredths={journalShowHundredths}
+              onJournalShowHundredthsChange={setJournalShowHundredths}
+              journalShowTotal={journalShowTotal}
+              onJournalShowTotalChange={setJournalShowTotal}
               timetableHideTeacherRoom={timetableHideTeacherRoom}
               onTimetableHideTeacherRoomChange={setTimetableHideTeacherRoom}
               timetableHidePairNumbers={timetableHidePairNumbers}
               onTimetableHidePairNumbersChange={setTimetableHidePairNumbers}
+              timetableDayStrip={timetableDayStrip}
+              onTimetableDayStripChange={setTimetableDayStrip}
               onClearAppData={handleClearAppData}
             />
               </div>
@@ -767,6 +823,7 @@ export default function MainPage() {
                     density={timetableDensity}
                     hideTeacherRoom={timetableHideTeacherRoom}
                     hidePairNumbers={timetableHidePairNumbers}
+                    showDayStrip={timetableDayStrip}
                   />
                 </div>
               )}
@@ -916,6 +973,8 @@ export default function MainPage() {
                     groupName={entry.groupName}
                     showAverageColumn={journalShowAverage}
                     denseCells={journalDenseCells}
+                    showHundredths={journalShowHundredths}
+                    showTotal={journalShowTotal}
                   />
                 ))}
               </div>
@@ -1077,6 +1136,8 @@ function JournalView({
   groupName,
   showAverageColumn = true,
   denseCells = false,
+  showHundredths = false,
+  showTotal = true,
 }: {
   data: any;
   onLogout: () => void;
@@ -1085,6 +1146,8 @@ function JournalView({
   groupName?: string;
   showAverageColumn?: boolean;
   denseCells?: boolean;
+  showHundredths?: boolean;
+  showTotal?: boolean;
 }) {
   const isDark = themeIsDark(theme);
   const cellBg = theme === "oled" ? "#000000" : isDark ? "#1f2630" : "#fefce8";
@@ -1092,10 +1155,21 @@ function JournalView({
   const subjectColPx = denseCells ? 140 : 160;
   const avgColPx = 48;
 
+  const formatAvg = (subject: any): string =>
+    formatComputedAverage(calcSubjectAverageFromMarks(subject), showHundredths);
+
+  const totalAvg =
+    showTotal && showAverageColumn
+      ? calcTotalAverageFromSubjects(data.subjects || [], showHundredths)
+      : null;
+
   const [selectedCell, setSelectedCell] = useState<{
     explanation: string;
     grades: string;
   } | null>(null);
+
+  /* Индекс выделенной строки предмета */
+  const [selectedSubjectIdx, setSelectedSubjectIdx] = useState<number | null>(null);
 
   if (!data?.subjects || data.subjects.length === 0) {
     return (
@@ -1170,9 +1244,33 @@ function JournalView({
             </tr>
           </thead>
           <tbody>
-            {data.subjects.map((subject: any, idx: number) => (
-              <tr key={idx} className="border-b border-gray-300 dark:border-zinc-700 hover:bg-blue-50/30 dark:hover:bg-zinc-800/70 transition-colors duration-150">
-                <td className="border-r border-gray-200 dark:border-zinc-600 px-2 py-1 text-[11px] font-semibold text-gray-900 dark:text-zinc-200 sticky left-0 z-10 bg-white dark:bg-zinc-900">{subject.name}</td>
+            {data.subjects.map((subject: any, idx: number) => {
+              const isSelected = selectedSubjectIdx === idx;
+
+              /* Цвета строки: выделена → синий, иначе обычный */
+              const rowCellBg = isSelected
+                ? isDark ? "#1e3a5f" : "#dbeafe"
+                : cellBg;
+              const stickyBg = isSelected
+                ? isDark ? "#1e3a5f" : "#dbeafe"
+                : isDark ? "#18212e" : "#ffffff";
+
+              return (
+              <tr
+                key={idx}
+                onClick={() => setSelectedSubjectIdx(isSelected ? null : idx)}
+                className={`border-b cursor-pointer ${
+                  isSelected
+                    ? isDark ? "border-blue-700" : "border-blue-300"
+                    : isDark ? "border-zinc-700 hover:bg-zinc-800/70" : "border-gray-300 hover:bg-blue-50/30"
+                }`}
+              >
+                <td
+                  className="border-r border-gray-200 dark:border-zinc-600 px-2 py-1 text-[11px] font-semibold sticky left-0 z-10"
+                  style={{ backgroundColor: stickyBg, color: isSelected ? (isDark ? "#93c5fd" : "#1d4ed8") : undefined }}
+                >
+                  {subject.name}
+                </td>
                 {(data.dates || []).map((_date: string, dateIdx: number) => {
                   const grades = subject.gradesMatrix?.[dateIdx] || [];
                   const explanation = grades
@@ -1183,11 +1281,11 @@ function JournalView({
                     .map((g: any) => g?.value)
                     .filter(Boolean)
                     .join(", ");
-                    return (
+                  return (
                     <td
                       key={dateIdx}
                       className="border-r border-gray-300 dark:border-zinc-600 text-center align-middle cursor-pointer"
-                      style={{ width: dateColPx, height: dateColPx, backgroundColor: cellBg }}
+                      style={{ width: dateColPx, height: dateColPx, backgroundColor: rowCellBg }}
                       onClick={() =>
                         setSelectedCell({
                           explanation: explanation || "Нет пояснения",
@@ -1197,18 +1295,61 @@ function JournalView({
                     >
                       <div className="flex items-center justify-center gap-0.5 flex-wrap">
                         {grades.slice(0, 4).map((grade: any, gIdx: number) => (
-                          <span key={gIdx} className="inline-flex items-center justify-center text-[9px] font-medium text-gray-900 dark:text-zinc-200 leading-none">{grade.value}</span>
-                          ))}
-                        </div>
+                          <span
+                            key={gIdx}
+                            className="inline-flex items-center justify-center text-[9px] font-medium text-gray-900 dark:text-zinc-200 leading-none"
+                            style={
+                              grade?.kind === "alert"
+                                ? { ...journalMarkAlertStyle("alert"), ...(isDark ? { color: "#f87171" } : {}) }
+                                : undefined
+                            }
+                          >
+                            {grade.value}
+                          </span>
+                        ))}
+                      </div>
                     </td>
-                    );
-                  })}
+                  );
+                })}
                 {showAverageColumn ? (
-                  <td className="border-l-2 border-gray-300 dark:border-zinc-600 px-1.5 py-1 text-center font-bold text-[11px] bg-gray-50 dark:bg-zinc-800 text-gray-900 dark:text-zinc-200">{subject.average}</td>
+                  <td
+                    className="border-l-2 border-gray-300 dark:border-zinc-600 px-1.5 py-1 text-center font-bold text-[11px]"
+                    style={{
+                      backgroundColor: isSelected ? (isDark ? "#1e3a5f" : "#bfdbfe") : undefined,
+                      borderColor: isSelected ? (isDark ? "#3b82f6" : "#93c5fd") : undefined,
+                      color: isSelected ? (isDark ? "#93c5fd" : "#1d4ed8") : (isDark ? "#e4e4e7" : "#111827"),
+                    }}
+                  >
+                    {formatAvg(subject)}
+                  </td>
                 ) : null}
               </tr>
-            ))}
+              );
+            })}
           </tbody>
+
+          {/* Строка «Общий балл» */}
+          {totalAvg !== null && (
+            <tfoot>
+              <tr className={`border-t-2 ${isDark ? "border-zinc-600 bg-zinc-800" : "border-gray-300 bg-gray-50"}`}>
+                <td
+                  className={`px-2 py-1.5 text-[11px] font-bold sticky left-0 z-10 ${
+                    isDark ? "bg-zinc-800 text-zinc-200" : "bg-gray-50 text-gray-900"
+                  }`}
+                >
+                  Общий балл
+                </td>
+                {(data.dates || []).map((_: any, i: number) => (
+                  <td key={i} className={`border-r ${isDark ? "border-zinc-700" : "border-gray-200"}`} />
+                ))}
+                <td className={`border-l-2 px-1.5 py-1.5 text-center font-bold text-[12px] ${
+                  isDark ? "border-zinc-600 text-blue-400" : "border-gray-300 text-blue-600"
+                }`}>
+                  {totalAvg}
+                </td>
+              </tr>
+            </tfoot>
+          )}
         </table>
                 </div>
       {selectedCell && (
@@ -1225,6 +1366,11 @@ function JournalView({
   );
 }
 
+/* ─── SettingsView ───────────────────────────────────────────────────────────
+   Страница настроек приложения.
+   Секции: Уведомления, Журнал, Расписание, Тема, Отсчёт, Очистка, О приложении.
+   Каждая секция — карточка с разделителями между строками (iOS-стиль).
+────────────────────────────────────────────────────────────────────────────── */
 function SettingsView(props: {
   theme: AppTheme;
   onThemeChange: (t: AppTheme) => void;
@@ -1244,10 +1390,16 @@ function SettingsView(props: {
   onJournalShowAverageChange: (v: boolean) => void;
   journalDenseCells: boolean;
   onJournalDenseCellsChange: (v: boolean) => void;
+  journalShowHundredths: boolean;
+  onJournalShowHundredthsChange: (v: boolean) => void;
+  journalShowTotal: boolean;
+  onJournalShowTotalChange: (v: boolean) => void;
   timetableHideTeacherRoom: boolean;
   onTimetableHideTeacherRoomChange: (v: boolean) => void;
   timetableHidePairNumbers: boolean;
   onTimetableHidePairNumbersChange: (v: boolean) => void;
+  timetableDayStrip: boolean;
+  onTimetableDayStripChange: (v: boolean) => void;
   onClearAppData: (opts: { clearCache: boolean; clearLoginHistory: boolean; clearTimetables: boolean }) => void;
 }) {
   const {
@@ -1269,10 +1421,16 @@ function SettingsView(props: {
     onJournalShowAverageChange,
     journalDenseCells,
     onJournalDenseCellsChange,
+    journalShowHundredths,
+    onJournalShowHundredthsChange,
+    journalShowTotal,
+    onJournalShowTotalChange,
     timetableHideTeacherRoom,
     onTimetableHideTeacherRoomChange,
     timetableHidePairNumbers,
     onTimetableHidePairNumbersChange,
+    timetableDayStrip,
+    onTimetableDayStripChange,
     onClearAppData,
   } = props;
 
@@ -1282,264 +1440,371 @@ function SettingsView(props: {
   const [clearLoginHistory, setClearLoginHistory] = useState(false);
   const [clearTimetables, setClearTimetables] = useState(false);
 
+  /* Базовые классы секции и строки */
+  const sectionCard = `rounded-2xl overflow-hidden ${
+    isDark ? "bg-zinc-900 border border-zinc-800" : "bg-white border border-gray-100 shadow-sm"
+  }`;
+  const divider = `${isDark ? "border-zinc-800" : "border-gray-100"}`;
+  const rowBase = `flex items-center justify-between gap-4 px-4 py-3.5`;
+  const labelPrimary = `text-sm ${isDark ? "text-zinc-100" : "text-gray-900"}`;
+  const labelSecondary = `text-sm ${isDark ? "text-zinc-400" : "text-gray-500"}`;
+  const sectionHeader = `px-4 pt-5 pb-2 text-xs font-semibold tracking-widest uppercase ${
+    isDark ? "text-zinc-500" : "text-gray-400"
+  }`;
+
   return (
-    <div className="p-4 pb-20">
-      <div className="flex items-center gap-3">
-        <img src="/minikbp.svg" alt="" className="h-11 w-11 shrink-0 object-contain" width={44} height={44} />
-        <h2 className={`text-xl font-bold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Настройки</h2>
+    <div className="pb-24">
+
+      {/* ── Заголовок ── */}
+      <div className={`flex items-center gap-3 px-4 pt-5 pb-4 ${isDark ? "border-zinc-800" : "border-gray-100"}`}>
+        <img src="/minikbp.svg" alt="" className="h-10 w-10 shrink-0 object-contain" width={40} height={40} />
+        <h2 className={`text-xl font-bold tracking-tight ${isDark ? "text-zinc-100" : "text-gray-900"}`}>
+          Настройки
+        </h2>
       </div>
 
-      <div className="mt-4 space-y-3">
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>
-            Уведомления
-          </div>
-          <div className={`mt-3 flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-            <span className="text-sm">Включить уведомления</span>
-            <ToggleSwitch checked={notificationsEnabled} onChange={onNotificationsEnabledChange} />
-          </div>
-          <div
-            className={`overflow-hidden transition-all duration-300 ease-out ${
-              notificationsEnabled ? "max-h-24 opacity-100 mt-3" : "max-h-0 opacity-0 mt-0"
-            }`}
-          >
-            <div className="space-y-2">
-              <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-                <span className="text-sm">Журнал</span>
-                <ToggleSwitch checked={notifyJournal} onChange={onNotifyJournalChange} />
-              </label>
-              <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-                <span className="text-sm">Расписание</span>
-                <ToggleSwitch checked={notifyTimetable} onChange={onNotifyTimetableChange} />
-              </label>
-            </div>
-          </div>
-        </div>
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Внешний вид
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Внешний вид</div>
+      <div className={sectionCard}>
 
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Журнал</div>
-          <div className="mt-3 space-y-3">
-            <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-              <span className="text-sm">Показывать колонку «Ср. зн.»</span>
-              <ToggleSwitch checked={journalShowAverage} onChange={onJournalShowAverageChange} />
-            </label>
-            <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-              <span className="text-sm">Плотнее ячейки с датами</span>
-              <ToggleSwitch checked={journalDenseCells} onChange={onJournalDenseCellsChange} />
-            </label>
-          </div>
-        </div>
-
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Расписание</div>
-          <div className="mt-3 flex items-center justify-between">
-            <span className={`text-sm ${isDark ? "text-zinc-300" : "text-gray-700"}`}>По умолчанию показывать замены</span>
-            <ToggleSwitch checked={showReplacementsByDefault} onChange={onShowReplacementsByDefaultChange} />
-          </div>
-          <label className={`mt-3 flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-            <span className="text-sm">Скрыть преподавателя и аудиторию в карточке пары</span>
-            <ToggleSwitch checked={timetableHideTeacherRoom} onChange={onTimetableHideTeacherRoomChange} />
-          </label>
-          <label className={`mt-3 flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-            <span className="text-sm">Скрыть номер пары слева</span>
-            <ToggleSwitch checked={timetableHidePairNumbers} onChange={onTimetableHidePairNumbersChange} />
-          </label>
-
-          <div className="mt-4">
-            <div className={`text-[13px] font-semibold mb-2 ${isDark ? "text-zinc-200" : "text-gray-700"}`}>Сжимать расписание</div>
-            <div className="grid grid-cols-3 gap-2">
-              {[
-                { id: "normal", label: "Обыч." },
-                { id: "compact", label: "Компакт." },
-                { id: "small", label: "Очень комп." },
-              ].map((opt) => (
+        {/* Тема — визуальные карточки */}
+        <div className={`px-4 py-3.5 border-b ${divider}`}>
+          <div className={`text-sm font-medium mb-3 ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Тема</div>
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { id: "light" as AppTheme, label: "Светлая", preview: "border border-gray-200 bg-white" },
+              { id: "dark"  as AppTheme, label: "Тёмная",  preview: "border border-zinc-700 bg-zinc-900" },
+              { id: "oled"  as AppTheme, label: "OLED",    preview: "border border-zinc-800 bg-black" },
+            ].map((opt) => {
+              const active = theme === opt.id;
+              return (
                 <button
                   key={opt.id}
                   type="button"
-                  onClick={() => onTimetableDensityChange(opt.id as any)}
-                  className={`rounded-xl border p-3 text-left ${
-                    timetableDensity === opt.id
-                      ? "border-blue-500"
+                  onClick={() => onThemeChange(opt.id)}
+                  className={`rounded-xl p-2.5 text-left transition-all ${
+                    active
+                      ? isDark
+                        ? "bg-blue-500/10 ring-2 ring-blue-500"
+                        : "bg-blue-50 ring-2 ring-blue-500"
                       : isDark
-                        ? "border-slate-800"
-                        : "border-gray-200"
+                        ? "bg-zinc-800 ring-1 ring-zinc-700"
+                        : "bg-gray-50 ring-1 ring-gray-200"
                   }`}
                 >
-                  <div className={`text-sm font-semibold ${timetableDensity === opt.id ? "text-blue-500" : isDark ? "text-zinc-200" : "text-gray-900"}`}>
+                  <div className={`h-9 rounded-lg ${opt.preview}`} />
+                  <div className={`mt-2 text-xs font-medium truncate ${
+                    active ? "text-blue-500" : isDark ? "text-zinc-300" : "text-gray-700"
+                  }`}>
                     {opt.label}
                   </div>
                 </button>
-              ))}
+              );
+            })}
+          </div>
+        </div>
+
+      </div>
+
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Уведомления
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Уведомления</div>
+      <div className={sectionCard}>
+
+        <label className={`${rowBase}`}>
+          <span className={labelPrimary}>Включить уведомления</span>
+          <ToggleSwitch checked={notificationsEnabled} onChange={onNotificationsEnabledChange} isDark={isDark} />
+        </label>
+
+        {/* Подопции уведомлений — плавное раскрытие */}
+        <div className={`overflow-hidden transition-all duration-300 ease-out ${
+          notificationsEnabled ? "max-h-40 opacity-100" : "max-h-0 opacity-0"
+        }`}>
+          <label className={`${rowBase} border-t ${divider}`}>
+            <div>
+              <div className={labelPrimary}>Журнал</div>
+              <div className={labelSecondary}>Уведомлять об изменениях в оценках</div>
             </div>
+            <ToggleSwitch checked={notifyJournal} onChange={onNotifyJournalChange} isDark={isDark} />
+          </label>
+          <label className={`${rowBase} border-t ${divider}`}>
+            <div>
+              <div className={labelPrimary}>Расписание</div>
+              <div className={labelSecondary}>Уведомлять об изменениях</div>
+            </div>
+            <ToggleSwitch checked={notifyTimetable} onChange={onNotifyTimetableChange} isDark={isDark} />
+          </label>
+        </div>
+
+      </div>
+
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Журнал
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Журнал</div>
+      <div className={sectionCard}>
+
+        <label className={`${rowBase}`}>
+          <span className={labelPrimary}>Показывать колонку «Ср. зн.»</span>
+          <ToggleSwitch checked={journalShowAverage} onChange={onJournalShowAverageChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={labelPrimary}>Плотнее ячейки с датами</span>
+          <ToggleSwitch checked={journalDenseCells} onChange={onJournalDenseCellsChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <div>
+            <div className={labelPrimary}>Сотые в среднем балле</div>
+            <div className={labelSecondary}>Например: 7.45 вместо 7.5</div>
+          </div>
+          <ToggleSwitch checked={journalShowHundredths} onChange={onJournalShowHundredthsChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <div>
+            <div className={labelPrimary}>Общий балл</div>
+            <div className={labelSecondary}>Среднее по всем предметам</div>
+          </div>
+          <ToggleSwitch checked={journalShowTotal} onChange={onJournalShowTotalChange} isDark={isDark} />
+        </label>
+
+      </div>
+
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Расписание
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Расписание</div>
+      <div className={sectionCard}>
+
+        <label className={`${rowBase}`}>
+          <span className={labelPrimary}>Показывать замены по умолчанию</span>
+          <ToggleSwitch checked={showReplacementsByDefault} onChange={onShowReplacementsByDefaultChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={`${labelPrimary} pr-8`}>Скрыть преподавателя и аудиторию</span>
+          <ToggleSwitch checked={timetableHideTeacherRoom} onChange={onTimetableHideTeacherRoomChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={labelPrimary}>Скрыть номер пары слева</span>
+          <ToggleSwitch checked={timetableHidePairNumbers} onChange={onTimetableHidePairNumbersChange} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={labelPrimary}>Панель дней (Пн–Сб)</span>
+          <ToggleSwitch checked={timetableDayStrip} onChange={onTimetableDayStripChange} isDark={isDark} />
+        </label>
+
+        {/* Плотность расписания — сегментированный контрол */}
+        <div className={`px-4 py-3.5 border-t ${divider}`}>
+          <div className={`text-sm font-medium mb-3 ${isDark ? "text-zinc-100" : "text-gray-900"}`}>
+            Плотность расписания
+          </div>
+          <div className={`flex rounded-xl overflow-hidden border ${isDark ? "border-zinc-700" : "border-gray-200"}`}>
+            {([
+              { id: "normal",  label: "Обычная"  },
+              { id: "compact", label: "Компакт." },
+              { id: "small",   label: "Мини"     },
+            ] as const).map((opt, i, arr) => {
+              const active = timetableDensity === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => onTimetableDensityChange(opt.id)}
+                  className={`flex-1 py-2 text-xs font-semibold transition-all ${
+                    i < arr.length - 1 ? `border-r ${isDark ? "border-zinc-700" : "border-gray-200"}` : ""
+                  } ${
+                    active
+                      ? "bg-blue-500 text-white"
+                      : isDark
+                        ? "bg-transparent text-zinc-400 hover:text-zinc-200"
+                        : "bg-transparent text-gray-500 hover:text-gray-700"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Очистка</div>
-          <div className="mt-3 space-y-3">
-            <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-              <span className="text-sm">Очистить кэш (журнал)</span>
-              <ToggleSwitch checked={clearCache} onChange={setClearCache} />
-            </label>
-            <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-              <span className="text-sm">Очистить историю входов</span>
-              <ToggleSwitch checked={clearLoginHistory} onChange={setClearLoginHistory} />
-            </label>
-            <label className={`flex items-center justify-between ${isDark ? "text-zinc-300" : "text-gray-700"}`}>
-              <span className="text-sm">Очистить все загруженные расписания</span>
-              <ToggleSwitch checked={clearTimetables} onChange={setClearTimetables} />
-            </label>
+      </div>
 
-            <button
-              type="button"
-              onClick={() => onClearAppData({ clearCache, clearLoginHistory, clearTimetables })}
-              className={`w-full mt-2 rounded-xl py-3 px-4 text-white font-medium transition-colors ${
-                clearCache || clearLoginHistory || clearTimetables
-                  ? "bg-[#ff5dc5] hover:bg-[#ff4fc0] active:bg-[#ff36b6]"
-                  : "bg-gray-400"
-              }`}
-              disabled={!(clearCache || clearLoginHistory || clearTimetables)}
-            >
-              Очистить выбранное
-            </button>
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Прочее
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Прочее</div>
+      <div className={sectionCard}>
+
+        <label className={`${rowBase}`}>
+          <div>
+            <div className={labelPrimary}>Отсчёт до урока</div>
+            <div className={labelSecondary}>Показывать таймер в расписании</div>
           </div>
-        </div>
+          <ToggleSwitch checked={countdownToLesson} onChange={onCountdownToLessonChange} isDark={isDark} />
+        </label>
 
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Отсчёт</div>
-          <div
-            className={`mt-3 flex items-center justify-between ${
-              isDark ? "text-zinc-300" : "text-gray-700"
+      </div>
+
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: Очистка данных
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>Очистка данных</div>
+      <div className={sectionCard}>
+
+        <label className={`${rowBase}`}>
+          <span className={labelPrimary}>Кэш журнала</span>
+          <ToggleSwitch checked={clearCache} onChange={setClearCache} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={labelPrimary}>История входов</span>
+          <ToggleSwitch checked={clearLoginHistory} onChange={setClearLoginHistory} isDark={isDark} />
+        </label>
+
+        <label className={`${rowBase} border-t ${divider}`}>
+          <span className={labelPrimary}>Загруженные расписания</span>
+          <ToggleSwitch checked={clearTimetables} onChange={setClearTimetables} isDark={isDark} />
+        </label>
+
+        <div className={`px-4 py-3.5 border-t ${divider}`}>
+          <button
+            type="button"
+            onClick={() => onClearAppData({ clearCache, clearLoginHistory, clearTimetables })}
+            disabled={!(clearCache || clearLoginHistory || clearTimetables)}
+            className={`w-full rounded-xl py-3 px-4 text-sm font-semibold transition-all ${
+              clearCache || clearLoginHistory || clearTimetables
+                ? "bg-rose-500 text-white active:scale-[0.98]"
+                : isDark
+                  ? "bg-zinc-800 text-zinc-600 cursor-not-allowed"
+                  : "bg-gray-100 text-gray-400 cursor-not-allowed"
             }`}
           >
-            <span className="text-sm">Включить отсчёт до урока</span>
-            <ToggleSwitch checked={countdownToLesson} onChange={onCountdownToLessonChange} />
-          </div>
+            Очистить выбранное
+          </button>
         </div>
 
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>Тема</div>
-          <div className="mt-3 grid grid-cols-3 gap-2">
-            <button
-              type="button"
-              onClick={() => onThemeChange("light")}
-              className={`rounded-xl border p-3 text-left ${
-                theme === "light" ? "border-blue-500" : isDark ? "border-slate-800" : "border-gray-200"
-              }`}
-            >
-              <div className="h-10 rounded-lg border border-gray-200 bg-white" />
-              <div className={`mt-2 text-sm font-medium ${isDark ? "text-zinc-200" : "text-gray-900"}`}>Светлая</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => onThemeChange("dark")}
-              className={`rounded-xl border p-3 text-left ${
-                theme === "dark" ? "border-blue-500" : isDark ? "border-slate-800" : "border-gray-200"
-              }`}
-            >
-              <div className="h-10 rounded-lg border border-zinc-700 bg-zinc-900" />
-              <div className={`mt-2 text-sm font-medium ${isDark ? "text-zinc-200" : "text-gray-900"}`}>Тёмная</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => onThemeChange("oled")}
-              className={`rounded-xl border p-3 text-left ${
-                theme === "oled" ? "border-blue-500" : isDark ? "border-slate-800" : "border-gray-200"
-              }`}
-            >
-              <div className="h-10 rounded-lg border border-zinc-800 bg-black" />
-              <div className={`mt-2 text-sm font-medium ${isDark ? "text-zinc-200" : "text-gray-900"}`}>OLED</div>
-            </button>
-          </div>
-        </div>
-
-        <div
-          className={`rounded-2xl border p-4 ${
-            isDark ? "border-zinc-800 bg-zinc-950" : "border-gray-200 bg-white"
-          }`}
-        >
-          <div className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-gray-900"}`}>О приложении</div>
-          <div className={`mt-3 text-sm ${isDark ? "text-zinc-300" : "text-gray-700"} space-y-1`}>
-            <div>Версия: Dev-0.1.44</div>
-            <div className="flex flex-col gap-2 pt-1">
-              <a
-                className="inline-flex items-center gap-1 rounded-[5px] bg-[#ff5dc5] px-3 py-1.5 text-white no-underline"
-                href="https://www.donationalerts.com/r/meowhiks_off"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                  <path d="M12 2 9.5 6H5.2l2.6 3.1L6.6 14l5.4-2.6L17.4 14l-1.2-4.9L18.8 6H14.5L12 2Zm-7 14h14v2H5v-2Zm1 4h12v2H6v-2Z" />
-                </svg>
-                Пожертвовать
-              </a>
-              <a
-                className="inline-flex items-center gap-1 rounded-[5px] bg-[#229ED9] px-3 py-1.5 text-white no-underline"
-                href="https://t.me/meowhiks"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                  <path d="M21.94 4.66c.3-.95-.64-1.82-1.53-1.43L3.17 9.53c-1.03.37-1 1.84.04 2.16l4.2 1.28 1.6 4.9c.31.96 1.6 1.17 2.2.37l2.36-3.14 4.15 3.07c.76.56 1.84.14 2.05-.8l2.17-12.71Z" />
-                </svg>
-                Telegram
-              </a>
-              <a
-                className="inline-flex items-center gap-1 rounded-[5px] bg-[#24292F] px-3 py-1.5 text-white no-underline"
-                href="https://github.com/meowhiks"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                  <path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.1.82-.26.82-.58v-2.2c-3.34.73-4.05-1.61-4.05-1.61-.55-1.4-1.34-1.77-1.34-1.77-1.1-.76.08-.74.08-.74 1.21.09 1.85 1.24 1.85 1.24 1.08 1.86 2.84 1.32 3.53 1 .11-.79.42-1.32.76-1.62-2.67-.3-5.48-1.34-5.48-5.95 0-1.32.47-2.4 1.24-3.25-.12-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.24a11.5 11.5 0 0 1 6 0c2.29-1.56 3.3-1.24 3.3-1.24.66 1.65.24 2.88.12 3.18.77.85 1.24 1.93 1.24 3.25 0 4.62-2.81 5.64-5.49 5.94.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.82.58A12 12 0 0 0 12 .5Z" />
-                </svg>
-                GitHub
-              </a>
-            </div>
-          </div>
-        </div>
       </div>
+
+      {/* ══════════════════════════════════════════
+          СЕКЦИЯ: О приложении
+      ══════════════════════════════════════════ */}
+      <div className={sectionHeader}>О приложении</div>
+      <div className={sectionCard}>
+
+        <div className={`${rowBase} border-b ${divider}`}>
+          <span className={labelPrimary}>Версия</span>
+          <span className={`text-sm font-medium ${isDark ? "text-zinc-400" : "text-gray-500"}`}>
+            Release 0.1.71
+          </span>
+        </div>
+
+        {/* Ссылки — каждая строка со стрелкой */}
+        {[
+          {
+            href: "https://www.donationalerts.com/r/meowhiks_off",
+            label: "Поддержать разработку",
+            sub: "DonationAlerts",
+            color: "text-[#ff5dc5]",
+            icon: (
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2 9.5 6H5.2l2.6 3.1L6.6 14l5.4-2.6L17.4 14l-1.2-4.9L18.8 6H14.5L12 2Zm-7 14h14v2H5v-2Zm1 4h12v2H6v-2Z" />
+              </svg>
+            ),
+            bg: "bg-[#ff5dc5]/10",
+          },
+          {
+            href: "https://t.me/meowhiks",
+            label: "Telegram",
+            sub: "@meowhiks",
+            color: "text-[#229ED9]",
+            icon: (
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M21.94 4.66c.3-.95-.64-1.82-1.53-1.43L3.17 9.53c-1.03.37-1 1.84.04 2.16l4.2 1.28 1.6 4.9c.31.96 1.6 1.17 2.2.37l2.36-3.14 4.15 3.07c.76.56 1.84.14 2.05-.8l2.17-12.71Z" />
+              </svg>
+            ),
+            bg: "bg-[#229ED9]/10",
+          },
+          {
+            href: "https://github.com/meowhiks",
+            label: "GitHub",
+            sub: "meowhiks",
+            color: isDark ? "text-zinc-200" : "text-gray-800",
+            icon: (
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.1.82-.26.82-.58v-2.2c-3.34.73-4.05-1.61-4.05-1.61-.55-1.4-1.34-1.77-1.34-1.77-1.1-.76.08-.74.08-.74 1.21.09 1.85 1.24 1.85 1.24 1.08 1.86 2.84 1.32 3.53 1 .11-.79.42-1.32.76-1.62-2.67-.3-5.48-1.34-5.48-5.95 0-1.32.47-2.4 1.24-3.25-.12-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.24a11.5 11.5 0 0 1 6 0c2.29-1.56 3.3-1.24 3.3-1.24.66 1.65.24 2.88.12 3.18.77.85 1.24 1.93 1.24 3.25 0 4.62-2.81 5.64-5.49 5.94.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.82.58A12 12 0 0 0 12 .5Z" />
+              </svg>
+            ),
+            bg: isDark ? "bg-zinc-700" : "bg-gray-200",
+          },
+        ].map((link, i, arr) => (
+          <a
+            key={link.href}
+            href={link.href}
+            target="_blank"
+            rel="noreferrer"
+            className={`${rowBase} no-underline group ${i < arr.length - 1 ? `border-b ${divider}` : ""}`}
+          >
+            <div className="flex items-center gap-3">
+              <span className={`flex h-8 w-8 items-center justify-center rounded-lg ${link.bg} ${link.color}`}>
+                {link.icon}
+              </span>
+              <div>
+                <div className={`text-sm font-medium ${isDark ? "text-zinc-100" : "text-gray-900"}`}>
+                  {link.label}
+                </div>
+                <div className={labelSecondary}>{link.sub}</div>
+              </div>
+            </div>
+            <svg
+              className={`h-4 w-4 shrink-0 ${isDark ? "text-zinc-600" : "text-gray-300"}`}
+              viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+            >
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+          </a>
+        ))}
+
+      </div>
+
+      {/* Нижний отступ */}
+      <div className="h-4" />
     </div>
   );
 }
 
-function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+/* ─── ToggleSwitch ───────────────────────────────────────────────────────────
+   Переключатель: включён/выключён.
+   Props: checked — текущее состояние, onChange — коллбэк, isDark — тема.
+────────────────────────────────────────────────────────────────────────────── */
+function ToggleSwitch({
+  checked,
+  onChange,
+  isDark,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  isDark?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-        checked ? "bg-blue-600" : "bg-zinc-300 dark:bg-zinc-700"
+      className={`relative inline-flex h-[28px] w-[50px] shrink-0 items-center rounded-full transition-colors duration-200 ${
+        checked ? "bg-blue-500" : isDark ? "bg-zinc-700" : "bg-gray-200"
       }`}
       aria-pressed={checked}
     >
       <span
-        className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-          checked ? "translate-x-5" : "translate-x-1"
+        className={`inline-block h-[22px] w-[22px] transform rounded-full bg-white shadow-sm transition-transform duration-200 ${
+          checked ? "translate-x-[24px]" : "translate-x-[3px]"
         }`}
       />
     </button>

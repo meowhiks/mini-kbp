@@ -10,7 +10,15 @@ import {
   getCachedFIO,
   getCachedJournal,
   getCachedTimetable,
+  journalDataNeedsKindRefresh,
+  journalMarkAlertStyle,
 } from "@/lib/client/kbpApi";
+import {
+  getTimetableDayCount,
+  getTimetableDayShortLabels,
+  getTimetableDisplayDay,
+  TIMETABLE_SLOT_NEXT_MONDAY,
+} from "@/lib/client/timetableDisplay";
 import { isNativeApp } from "@/lib/client/platform";
 import { storageGet, storageSet, storageRemove } from "@/lib/client/storage";
 import { requestNotificationPermissions } from "@/lib/client/notifications";
@@ -19,7 +27,7 @@ import { performBackgroundSync, shouldPerformSync } from "@/lib/client/backgroun
 interface Subject {
   id: string;
   name: string;
-  gradesMatrix: Record<number, Array<{ value: string; type: string }>>;
+  gradesMatrix: Record<number, Array<{ value: string; type: string; kind?: "normal" | "alert" }>>;
   average: string;
 }
 
@@ -30,6 +38,7 @@ export default function DashboardPage() {
   const [studentFIO, setStudentFIO] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [isRefreshingJournal, setIsRefreshingJournal] = useState(false);
   const [showRemoved, setShowRemoved] = useState(false);
   const [notifLink, setNotifLink] = useState<string | null>(null);
   const [notifToken, setNotifToken] = useState<string | null>(null);
@@ -37,6 +46,9 @@ export default function DashboardPage() {
   const [notifError, setNotifError] = useState("");
   const [notifCopied, setNotifCopied] = useState(false);
   const native = isNativeApp();
+
+  /* Выбранная строка предмета в таблице журнала */
+  const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(null);
 
   const handleLogout = async () => {
     await storageRemove("ej_login_data");
@@ -116,9 +128,10 @@ export default function DashboardPage() {
 
       // 2. Load journal from cache first
       const cachedJournal = await getCachedJournal();
-      if (cachedJournal) {
+      const cacheHasKind = cachedJournal && !journalDataNeedsKindRefresh(cachedJournal);
+      if (cacheHasKind) {
         setJournalData(cachedJournal);
-        setLoading(false); // Show cached data immediately
+        setLoading(false);
         console.log("[Dashboard] Loaded cached journal with", cachedJournal.subjects?.length, "subjects");
       }
 
@@ -143,20 +156,22 @@ export default function DashboardPage() {
 
       // 5. Try to refresh journal from network in background
       try {
+        setIsRefreshingJournal(true);
         const journalResult = await fetchJournalApi();
         if (journalResult.success && journalResult.data) {
           setJournalData(journalResult.data);
           setError("");
           console.log("[Dashboard] Updated journal from network");
-        } else if (!cachedJournal) {
-          // Only show error if we don't have cached data
+        } else if (!cacheHasKind) {
           setError(journalResult.error || "Ошибка загрузки журнала");
         }
       } catch (err) {
         console.error("[Dashboard] Error refreshing journal:", err);
-        if (!cachedJournal) {
+        if (!cacheHasKind) {
           setError("Нет подключения к интернету. Проверьте соединение.");
         }
+      } finally {
+        setIsRefreshingJournal(false);
       }
 
       // 6. Try to refresh timetable from network in background
@@ -183,6 +198,60 @@ export default function DashboardPage() {
     if (native) {
       requestNotificationPermissions();
     }
+  }, []);
+
+  // Refresh journal on app return (after ~5 minutes in background)
+  useEffect(() => {
+    let lastHiddenAt = 0;
+
+    const onVisibility = async () => {
+      if (document.visibilityState === "hidden") {
+        lastHiddenAt = Date.now();
+        return;
+      }
+      if (document.visibilityState !== "visible") return;
+      if (!lastHiddenAt) return;
+      const idleMs = Date.now() - lastHiddenAt;
+      lastHiddenAt = 0;
+      if (idleMs < 5 * 60 * 1000) return;
+
+      console.log("[Dashboard] App resumed after idle, refreshing journal...");
+      setIsRefreshingJournal(true);
+      try {
+        const journalResult = await fetchJournalApi();
+        if (journalResult.success && journalResult.data) {
+          setJournalData(journalResult.data);
+          setError("");
+        }
+      } catch (e) {
+        console.error("[Dashboard] Resume refresh failed:", e);
+      } finally {
+        setTimeout(() => setIsRefreshingJournal(false), 350);
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  // Periodic journal refresh while dashboard is open (every 5 minutes)
+  useEffect(() => {
+    const id = window.setInterval(async () => {
+      try {
+        setIsRefreshingJournal(true);
+        const journalResult = await fetchJournalApi();
+        if (journalResult.success && journalResult.data) {
+          setJournalData(journalResult.data);
+          setError("");
+        }
+      } catch (e) {
+        console.error("[Dashboard] Periodic refresh failed:", e);
+      } finally {
+        setTimeout(() => setIsRefreshingJournal(false), 350);
+      }
+    }, 5 * 60 * 1000);
+
+    return () => window.clearInterval(id);
   }, []);
 
   // Background sync effect - runs when dashboard is visible
@@ -379,6 +448,7 @@ export default function DashboardPage() {
     const currentTime = currentHours * 60 + currentMinutes;
 
     const dayPairs = timetableData.pairs.filter((p: any) => {
+      if ((p.weekOffset ?? 0) !== 0) return false;
       if (p.day !== dayIndex) return false;
       if (!p.subject) return false;
       const subjectTrimmed = p.subject.trim();
@@ -525,6 +595,13 @@ export default function DashboardPage() {
   return (
     <div className="min-h-screen bg-gray-50 p-4">
       <div className="max-w-7xl mx-auto">
+        {isRefreshingJournal && (
+          <div className="sticky top-2 z-50 px-1">
+            <div className="mx-auto w-fit rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700 shadow-sm">
+              Обновление…
+            </div>
+          </div>
+        )}
         {/* Header with FIO and logout */}
         <div className="flex items-center justify-between mb-3 px-1">
           <div className="flex items-center gap-3">
@@ -584,12 +661,23 @@ export default function DashboardPage() {
               </tr>
             </thead>
             <tbody>
-              {journalData.subjects.map((subject: Subject) => (
+              {journalData.subjects.map((subject: Subject) => {
+                const isSelected = selectedSubjectId === subject.id;
+                return (
                 <tr
                   key={subject.id}
-                  className="border-b border-gray-300 hover:bg-blue-50/30 transition-colors duration-150 cursor-pointer group"
+                  onClick={() => setSelectedSubjectId(isSelected ? null : subject.id)}
+                  className={`border-b cursor-pointer group ${
+                    isSelected
+                      ? "border-blue-400 bg-blue-100/60"
+                      : "border-gray-300 hover:bg-blue-50/30"
+                  }`}
                 >
-                  <td className="border-r border-gray-200 px-2 py-1 text-[11px] font-semibold text-gray-900 sticky left-0 z-10 bg-white group-hover:bg-blue-50/30 transition-colors">
+                  <td className={`border-r px-2 py-1 text-[11px] font-semibold sticky left-0 z-10 ${
+                    isSelected
+                      ? "border-blue-300 bg-blue-100 text-blue-900"
+                      : "border-gray-200 bg-white text-gray-900 group-hover:bg-blue-50/30"
+                  }`}>
                     {subject.name}
                   </td>
                   {dates.map((date: string, dateIdx: number) => {
@@ -648,7 +736,11 @@ export default function DashboardPage() {
                     return (
                       <td
                         key={dateIdx}
-                        className="border-r border-gray-300 text-center align-middle cursor-help group-hover:bg-blue-50/30 transition-colors"
+                        className={`border-r text-center align-middle cursor-help ${
+                          isSelected
+                            ? "border-blue-300 bg-blue-100/70"
+                            : "border-gray-300 bg-yellow-50 group-hover:bg-blue-50/30"
+                        }`}
                         style={{
                           minWidth: "24px",
                           minHeight: "24px",
@@ -659,7 +751,6 @@ export default function DashboardPage() {
                           padding: "2px",
                           boxSizing: "border-box",
                           overflow: "hidden",
-                          backgroundColor: "#fefce8",
                         }}
                         title={grades.length > 0 ? getTooltipText() : undefined}
                       >
@@ -670,9 +761,10 @@ export default function DashboardPage() {
                                 return (
                                   <span
                                     key={gradeIdx}
-                                    className="inline-flex items-center justify-center text-[9px] font-medium text-gray-900 leading-none"
+                                    className="inline-flex items-center justify-center text-[9px] font-medium leading-none text-gray-900"
                                     style={{
                                       gridColumn: "1 / 3",
+                                      ...journalMarkAlertStyle(grade.kind),
                                     }}
                                   >
                                     {grade.value}
@@ -682,7 +774,8 @@ export default function DashboardPage() {
                               return (
                                 <span
                                   key={gradeIdx}
-                                  className="inline-flex items-center justify-center text-[9px] font-medium text-gray-900 leading-none"
+                                  className="inline-flex items-center justify-center text-[9px] font-medium leading-none text-gray-900"
+                                  style={journalMarkAlertStyle(grade.kind)}
                                 >
                                   {grade.value}
                                 </span>
@@ -693,11 +786,16 @@ export default function DashboardPage() {
                       </td>
                     );
                   })}
-                  <td className="border-l-2 border-gray-300 px-1.5 py-1 text-center font-bold text-[11px] bg-gray-50 text-gray-900 group-hover:bg-blue-50/30 transition-colors">
+                  <td className={`border-l-2 px-1.5 py-1 text-center font-bold text-[11px] ${
+                    isSelected
+                      ? "border-blue-400 bg-blue-200/60 text-blue-900"
+                      : "border-gray-300 bg-gray-50 text-gray-900 group-hover:bg-blue-50/30"
+                  }`}>
                     {subject.average}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -762,11 +860,16 @@ export default function DashboardPage() {
               </div>
             )}
             <div className="border border-gray-200 rounded-lg overflow-hidden shadow-sm bg-white">
+              {(() => {
+                const timetableDayCount = getTimetableDayCount(timetableData);
+                const timetableDayLabels = getTimetableDayShortLabels(timetableData);
+                const dayColWidth = `calc((100% - 40px) / ${timetableDayCount})`;
+                return (
               <div
                 className="overflow-x-auto overflow-y-hidden -webkit-overflow-scrolling-touch"
                 style={{ WebkitOverflowScrolling: "touch" }}
               >
-                <table className="w-full border-collapse text-sm" style={{ minWidth: "600px" }}>
+                <table className="w-full border-collapse text-sm" style={{ minWidth: `${520 + timetableDayCount * 80}px` }}>
                   <thead>
                     <tr className="bg-gray-50 border-b border-gray-200">
                       <th className="border-r border-gray-200 px-0 py-0 text-center font-semibold text-xs w-8 bg-orange-50">
@@ -780,100 +883,37 @@ export default function DashboardPage() {
                         </div>
                       </th>
                       <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-10 bg-gray-100">#</th>
-                      <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Пн</div>
+                      {timetableDayLabels.map((dayLabel, dayIdx) => (
+                      <th
+                        key={dayIdx}
+                        className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs last:border-r-0"
+                        style={{ width: dayColWidth }}
+                      >
+                        <div className="leading-tight">{dayLabel}</div>
                         <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[0]?.label || ""}
+                          {timetableData?.dayReplacementStatus?.[dayIdx]?.label || ""}
                         </div>
-                        {timetableData?.dayStartTimes?.[0]?.start && (
+                        {timetableData?.dayStartTimes?.[dayIdx]?.start && (
                           <div className="text-[9px] font-normal text-gray-600 mt-0.5">
                             <div className="text-gray-500">Начало - Конец:</div>
                             <div>
-                              {timetableData.dayStartTimes[0].start} - {timetableData.dayStartTimes[0].end}
+                              {timetableData.dayStartTimes[dayIdx].start} - {timetableData.dayStartTimes[dayIdx].end}
                             </div>
                           </div>
                         )}
                       </th>
-                      <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Вт</div>
-                        <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[1]?.label || ""}
-                        </div>
-                        {timetableData?.dayStartTimes?.[1]?.start && (
-                          <div className="text-[9px] font-normal text-gray-600 mt-0.5">
-                            <div className="text-gray-500">Начало - Конец:</div>
-                            <div>
-                              {timetableData.dayStartTimes[1].start} - {timetableData.dayStartTimes[1].end}
-                            </div>
-                          </div>
-                        )}
-                      </th>
-                      <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Ср</div>
-                        <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[2]?.label || ""}
-                        </div>
-                        {timetableData?.dayStartTimes?.[2]?.start && (
-                          <div className="text-[9px] font-normal text-gray-600 mt-0.5">
-                            <div className="text-gray-500">Начало - Конец:</div>
-                            <div>
-                              {timetableData.dayStartTimes[2].start} - {timetableData.dayStartTimes[2].end}
-                            </div>
-                          </div>
-                        )}
-                      </th>
-                      <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Чт</div>
-                        <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[3]?.label || ""}
-                        </div>
-                        {timetableData?.dayStartTimes?.[3]?.start && (
-                          <div className="text-[9px] font-normal text-gray-600 mt-0.5">
-                            <div className="text-gray-500">Начало - Конец:</div>
-                            <div>
-                              {timetableData.dayStartTimes[3].start} - {timetableData.dayStartTimes[3].end}
-                            </div>
-                          </div>
-                        )}
-                      </th>
-                      <th className="border-r border-gray-200 px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Пт</div>
-                        <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[4]?.label || ""}
-                        </div>
-                        {timetableData?.dayStartTimes?.[4]?.start && (
-                          <div className="text-[9px] font-normal text-gray-600 mt-0.5">
-                            <div className="text-gray-500">Начало - Конец:</div>
-                            <div>
-                              {timetableData.dayStartTimes[4].start} - {timetableData.dayStartTimes[4].end}
-                            </div>
-                          </div>
-                        )}
-                      </th>
-                      <th className="px-2 py-2 text-center font-semibold text-xs w-[calc((100%-40px)/6)]">
-                        <div>Сб</div>
-                        <div className="text-[9px] font-semibold text-blue-600 mt-0.5">
-                          {timetableData?.dayReplacementStatus?.[5]?.label || ""}
-                        </div>
-                        {timetableData?.dayStartTimes?.[5]?.start && (
-                          <div className="text-[9px] font-normal text-gray-600 mt-0.5">
-                            <div className="text-gray-500">Начало - Конец:</div>
-                            <div>
-                              {timetableData.dayStartTimes[5].start} - {timetableData.dayStartTimes[5].end}
-                            </div>
-                          </div>
-                        )}
-                      </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
                     {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map((pairNum) => {
                       const pairsForPair = timetableData.pairs?.filter((p: any) => p.pairNumber === pairNum) || [];
-                      const pairsByDay: any[][] = [[], [], [], [], [], []];
+                      const pairsByDay: any[][] = Array.from({ length: timetableDayCount }, () => []);
 
                       pairsForPair.forEach((pair: any) => {
-                        if (pair.day >= 0 && pair.day < 6) {
-                          pairsByDay[pair.day].push(pair);
+                        const slot = getTimetableDisplayDay(pair);
+                        if (slot >= 0 && slot < timetableDayCount) {
+                          pairsByDay[slot].push(pair);
                         }
                       });
 
@@ -895,7 +935,10 @@ export default function DashboardPage() {
                               return p.status === "added" || p.status === "replaced" || p.status === "normal";
                             });
 
-                            const isCurrentPair = currentPair && currentPair.day === dayIdx && currentPair.pairNumber === pairNum;
+                            const isCurrentPair =
+                              currentPair &&
+                              getTimetableDisplayDay(currentPair) === dayIdx &&
+                              currentPair.pairNumber === pairNum;
                             const hasValidPair = filteredPairs.some((p: any) => {
                               if (!p.subject) return false;
                               const subjectTrimmed = p.subject.trim();
@@ -966,7 +1009,10 @@ export default function DashboardPage() {
                                                     {weekDayGrades.map((grade, gIdx) => (
                                                       <span
                                                         key={gIdx}
-                                                        className="inline-flex items-center justify-center w-5 h-5 text-[10px] font-bold text-gray-900 bg-yellow-300 rounded shadow-sm"
+                                                        className={`inline-flex items-center justify-center w-5 h-5 text-[10px] font-bold rounded shadow-sm ${
+                                                          grade.kind === "alert" ? "bg-red-100" : "bg-yellow-300 text-gray-900"
+                                                        }`}
+                                                        style={journalMarkAlertStyle(grade.kind)}
                                                         title={grade.type || "Оценка"}
                                                       >
                                                         {grade.value}
@@ -994,7 +1040,8 @@ export default function DashboardPage() {
                   </tbody>
                 </table>
               </div>
-            </div>
+                );
+              })()}
             <div className="mt-4 px-1">
               <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
                 <h3 className="text-sm font-semibold text-gray-900 mb-2">Обозначения цветов:</h3>
@@ -1017,6 +1064,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
               </div>
+            </div>
             </div>
           </div>
         )}

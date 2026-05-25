@@ -130,7 +130,7 @@ public class NotificationWorker extends Worker {
         }
 
         NotificationCompat.Builder builder = new NotificationCompat.Builder(context, channelId)
-            .setSmallIcon(R.drawable.ic_stat_minikbp)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(body)
             .setPriority(priority)

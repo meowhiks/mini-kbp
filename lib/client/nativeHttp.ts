@@ -6,6 +6,18 @@ export type NativeHttpResponse = {
   data: string;
 };
 
+export function extractCookiePairs(setCookieHeaderValue: string | undefined): string[] {
+  if (!setCookieHeaderValue) return [];
+  // Split "a=b; Path=/, c=d; Path=/" safely-ish: only on commas before cookie-name=
+  const parts = setCookieHeaderValue.split(/,(?=\s*[^=;,]+\s*=)/);
+  const pairs: string[] = [];
+  for (const part of parts) {
+    const m = part.trim().match(/^([^=;,\s]+)=([^;]*)/);
+    if (m) pairs.push(`${m[1]}=${m[2]}`);
+  }
+  return pairs;
+}
+
 function normalizeHeaders(headers: HttpResponse["headers"]): Record<string, string> {
   if (!headers || typeof headers !== "object") return {};
   const out: Record<string, string> = {};

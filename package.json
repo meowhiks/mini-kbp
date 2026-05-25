@@ -1,11 +1,12 @@
 {
   "name": "kbp-app",
-  "version": "0.1.44",
+  "version": "0.1.47",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "build:mobile": "node build-mobile.js",
+    "build:android": "node build-mobile.js && npx cap sync",
     "start": "next start",
     "lint": "eslint",
     "cap:sync": "npx cap sync",

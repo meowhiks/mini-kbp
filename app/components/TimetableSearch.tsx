@@ -192,6 +192,38 @@ export default function TimetableSearch({ onSelectResult }: TimetableSearchProps
     setRebuildProgress(0);
   };
 
+  const highlight = (text: string, q: string) => {
+    const needle = q.trim();
+    if (!needle || needle.length < 2) return text;
+    const idx = text.toLowerCase().indexOf(needle.toLowerCase());
+    if (idx === -1) return text;
+    const before = text.slice(0, idx);
+    const hit = text.slice(idx, idx + needle.length);
+    const after = text.slice(idx + needle.length);
+    return (
+      <>
+        {before}
+        <span className="bg-yellow-200 text-gray-900 rounded px-1">{hit}</span>
+        {after}
+      </>
+    );
+  };
+
+  const typeLabel = (t: SearchResult["type"]) => {
+    switch (t) {
+      case "group":
+        return "Группа";
+      case "teacher":
+        return "Преподаватель";
+      case "place":
+        return "Аудитория";
+      case "subject":
+        return "Предмет";
+      default:
+        return "Результат";
+    }
+  };
+
   return (
     <div ref={containerRef} className="relative w-full">
       {/* Search Input */}
@@ -206,11 +238,27 @@ export default function TimetableSearch({ onSelectResult }: TimetableSearchProps
           placeholder="Поиск по группам, преподавателям, аудиториям..."
           className="w-full bg-white border border-gray-300 text-gray-900 placeholder-gray-400
                      focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100
-                     text-base px-4 py-3 pr-10
+                     text-base px-4 py-3 pr-20
                      transition-all duration-200"
           style={{ borderRadius: "5px" }}
         />
-        <div className="absolute right-3 top-1/2 -translate-y-1/2">
+        <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+          {query.trim().length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setQuery("");
+                setResults([]);
+                setShowResults(false);
+                inputRef.current?.focus();
+              }}
+              className="text-gray-400 hover:text-gray-600 text-lg leading-none"
+              aria-label="Очистить поиск"
+              title="Очистить"
+            >
+              ×
+            </button>
+          )}
           {loading ? (
             <div className="w-5 h-5 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin" />
           ) : (
@@ -301,7 +349,12 @@ export default function TimetableSearch({ onSelectResult }: TimetableSearchProps
               className="w-full text-left px-4 py-3 hover:bg-gray-50 transition-colors flex items-center gap-3 border-b border-gray-100 last:border-b-0"
             >
               <div className="flex-1 min-w-0">
-                <div className="font-medium text-gray-900 truncate">{result.name}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium text-gray-900 truncate">{highlight(result.name, query)}</div>
+                  <span className="text-[10px] font-semibold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">
+                    {typeLabel(result.type)}
+                  </span>
+                </div>
               </div>
             </button>
           ))}

@@ -16,12 +16,7 @@ public class BootReceiver extends BroadcastReceiver {
             Log.d(TAG, "Device boot completed, restarting background sync");
 
             try {
-                // Проверяем настройки
-                SharedPreferences mainPrefs = context.getSharedPreferences("app_settings_v1", Context.MODE_PRIVATE);
-                boolean notificationsEnabled = mainPrefs.getBoolean("notificationsEnabled", false);
-
-                if (notificationsEnabled) {
-                    // Запускаем периодическую синхронизацию
+                if (readNotificationsEnabled(context)) {
                     NotificationScheduler.schedulePeriodicSync(context);
                     Log.d(TAG, "Background sync restarted after boot");
                 } else {
@@ -31,5 +26,24 @@ public class BootReceiver extends BroadcastReceiver {
                 Log.e(TAG, "Failed to restart background sync after boot", e);
             }
         }
+    }
+
+    /**
+     * Чтение notificationsEnabled из CAPPreferences (TypeScript / @capacitor/preferences).
+     * Fallback: нативный SharedPreferences (legacy).
+     * Порядок: CAPPreferences v5 → PluginStorage v4 → нативный app_settings_v1.
+     */
+    private boolean readNotificationsEnabled(Context context) {
+        for (String prefsName : new String[]{"CAPPreferences", "PluginStorage"}) {
+            String raw = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+                    .getString("app_settings_v1", null);
+            if (raw != null) {
+                try {
+                    return new org.json.JSONObject(raw).optBoolean("notificationsEnabled", false);
+                } catch (Exception ignored) {}
+            }
+        }
+        return context.getSharedPreferences("app_settings_v1", Context.MODE_PRIVATE)
+                .getBoolean("notificationsEnabled", false);
     }
 }

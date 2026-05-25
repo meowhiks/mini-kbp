@@ -55,26 +55,48 @@ public class MainActivity extends BridgeActivity {
                 }
             }
 
+            // Без этого WorkManager убивается на Xiaomi / Huawei / Samsung через ~15 минут.
+            // Запрашиваем игнорирование оптимизации батареи — критично для фоновой работы.
+            if (!PermissionHelper.isBatteryOptimizationDisabled(this)) {
+                Log.d(TAG, "Requesting battery optimization disable");
+                PermissionHelper.requestBatteryOptimizationDisable(this);
+            }
+
             prefs.edit().putBoolean("background_sync_initialized", true).apply();
         }
     }
 
     /**
-     * Проверяет настройки и запускает фоновую синхронизацию если нужно
+     * Запуск/остановка периодической синхронизации по флагу notificationsEnabled из CAPPreferences.
      */
     private void checkAndStartBackgroundSync() {
-        SharedPreferences prefs = getSharedPreferences("app_settings_v1", MODE_PRIVATE);
-        boolean notificationsEnabled = prefs.getBoolean("notificationsEnabled", false);
-
-        if (notificationsEnabled) {
+        if (readNotificationsEnabled()) {
             if (!NotificationScheduler.isPeriodicSyncRunning(this)) {
                 Log.d(TAG, "Starting periodic background sync");
                 NotificationScheduler.schedulePeriodicSync(this);
             }
         } else {
-            // Если уведомления отключены - отменяем синхронизацию
             Log.d(TAG, "Notifications disabled, cancelling periodic sync");
             NotificationScheduler.cancelPeriodicSync(this);
         }
+    }
+
+    /**
+     * Чтение notificationsEnabled из CAPPreferences (TypeScript / @capacitor/preferences).
+     * Fallback: нативный SharedPreferences (legacy).
+     * Порядок: CAPPreferences v5 → PluginStorage v4 → нативный app_settings_v1.
+     */
+    private boolean readNotificationsEnabled() {
+        for (String prefsName : new String[]{"CAPPreferences", "PluginStorage"}) {
+            String raw = getSharedPreferences(prefsName, MODE_PRIVATE)
+                    .getString("app_settings_v1", null);
+            if (raw != null) {
+                try {
+                    return new org.json.JSONObject(raw).optBoolean("notificationsEnabled", false);
+                } catch (Exception ignored) {}
+            }
+        }
+        return getSharedPreferences("app_settings_v1", MODE_PRIVATE)
+                .getBoolean("notificationsEnabled", false);
     }
 }

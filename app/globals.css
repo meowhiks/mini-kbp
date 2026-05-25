@@ -68,7 +68,7 @@
 @keyframes timetable-day-slide-r {
   from {
     opacity: 0.72;
-    transform: translateX(14px);
+    transform: translateX(110vw);
   }
   to {
     opacity: 1;
@@ -79,7 +79,7 @@
 @keyframes timetable-day-slide-l {
   from {
     opacity: 0.72;
-    transform: translateX(-14px);
+    transform: translateX(-110vw);
   }
   to {
     opacity: 1;
@@ -88,11 +88,11 @@
 }
 
 .timetable-day-in-r {
-  animation: timetable-day-slide-r 0.32s ease-out both;
+  animation: timetable-day-slide-r 0.38s cubic-bezier(0.22, 0.9, 0.2, 1) both;
 }
 
 .timetable-day-in-l {
-  animation: timetable-day-slide-l 0.32s ease-out both;
+  animation: timetable-day-slide-l 0.38s cubic-bezier(0.22, 0.9, 0.2, 1) both;
 }
 
 .animate-shimmer {

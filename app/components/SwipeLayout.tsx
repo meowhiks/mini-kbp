@@ -15,9 +15,6 @@ export default function SwipeLayout({ children, initialIndex = 1, onIndexChange 
   const [startX, setStartX] = useState(0);
   const [startY, setStartY] = useState(0);
   const [translateX, setTranslateX] = useState(-initialIndex * 100);
-  const [showIndicator, setShowIndicator] = useState(false);
-  const [indicatorProgress, setIndicatorProgress] = useState(0);
-  const [indicatorDirection, setIndicatorDirection] = useState<'left' | 'right' | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const velocityRef = useRef(0);
@@ -81,13 +78,6 @@ export default function SwipeLayout({ children, initialIndex = 1, onIndexChange 
 
     const baseTranslate = -currentIndex * 100;
     setTranslateX(baseTranslate + percent);
-
-    // Показываем визуальный индикатор
-    if (Math.abs(diffX) > SWIPE_THRESHOLD / 2) {
-      setShowIndicator(true);
-      setIndicatorDirection(diffX > 0 ? 'right' : 'left');
-      setIndicatorProgress(Math.min(Math.abs(diffX) / (window.innerWidth * SWITCH_THRESHOLD), 1));
-    }
   };
 
   const handleTouchEnd = (e: React.TouchEvent | React.MouseEvent) => {
@@ -113,9 +103,6 @@ export default function SwipeLayout({ children, initialIndex = 1, onIndexChange 
     }
 
     setIsDragging(false);
-    setShowIndicator(false);
-    setIndicatorProgress(0);
-    setIndicatorDirection(null);
   };
 
   const goToPage = (index: number) => {
@@ -162,7 +149,7 @@ export default function SwipeLayout({ children, initialIndex = 1, onIndexChange 
           className="flex h-full transition-transform duration-300 ease-out"
           style={{
             transform: `translateX(${translateX}%)`,
-            transition: isDragging ? "none" : "transform 0.3s ease-out",
+            transition: isDragging ? "none" : "transform 0.35s cubic-bezier(0.22, 0.9, 0.2, 1)",
           }}
         >
           {children.map((child, index) => (
@@ -175,49 +162,9 @@ export default function SwipeLayout({ children, initialIndex = 1, onIndexChange 
             </div>
           ))}
         </div>
-
-        {/* Визуальный индикатор свайпа */}
-        {showIndicator && (
-          <div
-            className="absolute top-14 left-1/2 transform -translate-x-1/2 transition-opacity duration-200"
-            style={{ opacity: indicatorProgress }}
-          >
-            <div className="bg-gray-800 bg-opacity-90 rounded-lg px-4 py-2 flex items-center gap-3 shadow-lg">
-              {/* Анимированная стрелка влево */}
-              {indicatorDirection === 'right' && currentIndex > 0 && (
-                <span className="text-white text-lg animate-pulse">‹</span>
-              )}
-
-              {/* Прогресс-бар */}
-              <div className="w-24 h-1 bg-gray-600 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 transition-all duration-100"
-                  style={{
-                    width: `${indicatorProgress * 100}%`,
-                    transform: indicatorDirection === 'left'
-                      ? `translateX(${(1 - indicatorProgress) * 50}%)`
-                      : `translateX(-${(1 - indicatorProgress) * 50}%)`
-                  }}
-                />
-              </div>
-
-              {/* Анимированная стрелка вправо */}
-              {indicatorDirection === 'left' && currentIndex < children.length - 1 && (
-                <span className="text-white text-lg animate-pulse">›</span>
-              )}
-            </div>
-          </div>
-        )}
       </div>
 
-      {/* Swipe Hint */}
-      <div className="py-2 text-center text-xs text-gray-400">
-        {currentIndex === 0
-          ? "← Свайп вправо для главной"
-          : currentIndex === 1
-          ? "← Свайп влево для расписания | Свайп вправо для журнала →"
-          : "Свайп влево для главной →"}
-      </div>
+      <div className="py-2" />
     </div>
   );
 }

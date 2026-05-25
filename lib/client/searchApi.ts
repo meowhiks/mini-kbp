@@ -1,3 +1,4 @@
+import { parseTimetableHtml } from "@/lib/client/kbpApi";
 import { isNativeApp } from "@/lib/client/platform";
 import { nativeRequestText } from "@/lib/client/nativeHttp";
 import { storageGetObject, storageSetObject, storageRemove } from "@/lib/client/storage";
@@ -311,7 +312,7 @@ export async function fetchTimetableByCategory(
   try {
     // Native mode
     const page = await nativeRequestText({
-      url: `https://kbp.by/rasp/timetable/view_beta_kbp/?cat=${category}&id=${id}`,
+      url: `https://kbp.by/rasp/timetable/view_beta_kbp/?page=stable&cat=${category}&id=${id}`,
       method: "GET",
       headers: {
         "User-Agent":
@@ -332,210 +333,11 @@ export async function fetchTimetableByCategory(
 }
 
 function parseTimetableFromPage(html: string, id: string, category: string): any {
-  const data: any = {
-    id,
-    category,
-    pairs: [],
-    dayStartTimes: [
-      { start: "", end: "" },
-      { start: "", end: "" },
-      { start: "", end: "" },
-      { start: "", end: "" },
-      { start: "", end: "" },
-      { start: "", end: "" },
-    ],
-    dayReplacementStatus: [
-      { label: "", hasChanges: false, noChanges: false },
-      { label: "", hasChanges: false, noChanges: false },
-      { label: "", hasChanges: false, noChanges: false },
-      { label: "", hasChanges: false, noChanges: false },
-      { label: "", hasChanges: false, noChanges: false },
-      { label: "", hasChanges: false, noChanges: false },
-    ],
-  };
-
-  // Extract title/name
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-  if (titleMatch) {
-    data.title = titleMatch[1].replace(" - Расписание КБП", "").trim();
-  }
-
-  const weekDays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"];
-
-  // Find timetable table
-  const tableMatches = Array.from(html.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi));
-  let tableContent = "";
-  for (const match of tableMatches) {
-    const content = match[1];
-    if (content.includes("pair-number") && content.includes("day=")) {
-      tableContent = content;
-      break;
-    }
-  }
-
-  if (!tableContent) return data;
-
-  const replacementRowMatch = tableContent.match(/<tr[^>]*class="[^"]*zamena[^"]*"[^>]*>([\s\S]*?)<\/tr>/i);
-  if (replacementRowMatch) {
-    const replacementCells = Array.from(replacementRowMatch[1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi));
-    for (let i = 0; i < 6; i++) {
-      const content = replacementCells[i + 1]?.[1] || "";
-      const plain = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      const hasChanges = /Показать\s+замены/i.test(plain);
-      const noChanges = /Замен\s+нет/i.test(plain);
-      data.dayReplacementStatus[i] = {
-        label: hasChanges ? "Есть замены" : noChanges ? "Замен нет" : "",
-        hasChanges,
-        noChanges,
-      };
-    }
-  }
-
-  // Parse rows
-  const rowMatches = Array.from(tableContent.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g));
-  for (const rowMatch of rowMatches) {
-    const rowContent = rowMatch[1];
-    const pairNumberMatch = rowContent.match(/<td[^>]*class="[^"]*number[^"]*"[^>]*>(\d+)<\/td>/);
-    if (!pairNumberMatch) continue;
-    const pairNumber = parseInt(pairNumberMatch[1]);
-
-    const dayCells = Array.from(rowContent.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g));
-    if (dayCells.length < 8) continue;
-
-    for (let cellIndex = 1; cellIndex < dayCells.length - 1; cellIndex++) {
-      const cellContent = dayCells[cellIndex][1];
-      let dayIndex: number | null = null;
-
-      const dayCommentMatch = cellContent.match(/<!--[^>]*day="(\d+)"[^>]*-->/);
-      if (dayCommentMatch) {
-        const dayFromComment = parseInt(dayCommentMatch[1]);
-        if (dayFromComment >= 1 && dayFromComment <= 6) dayIndex = dayFromComment - 1;
-      }
-      if (dayIndex === null) {
-        dayIndex = cellIndex - 1;
-        if (dayIndex < 0 || dayIndex > 5) continue;
-      }
-
-      if (cellContent.includes("empty-pair") && !cellContent.includes("pair")) continue;
-
-      // Parse pair divs
-      let pairStartIndex = 0;
-      let iterations = 0;
-      while (pairStartIndex < cellContent.length && iterations < 100) {
-        iterations++;
-        const pairStartMatch = cellContent.substring(pairStartIndex).match(/<div[^>]*class="([^"]*pair[^"]*)"[^>]*>/i);
-        if (!pairStartMatch) break;
-
-        const pairStartPos = pairStartIndex + (pairStartMatch.index || 0);
-        const pairClasses = pairStartMatch[1] || "";
-        const pairTagStart = pairStartPos + pairStartMatch[0].length;
-
-        let depth = 1;
-        let pos = pairTagStart;
-        let pairEndPos = -1;
-        let depthIterations = 0;
-        while (pos < cellContent.length && depth > 0 && depthIterations < 1000) {
-          depthIterations++;
-          const nextDivOpen = cellContent.indexOf("<div", pos);
-          const nextDivClose = cellContent.indexOf("<\/div>", pos);
-          if (nextDivClose === -1) break;
-          if (nextDivOpen !== -1 && nextDivOpen < nextDivClose) {
-            depth++;
-            pos = nextDivOpen + 4;
-          } else {
-            depth--;
-            if (depth === 0) {
-              pairEndPos = nextDivClose;
-              break;
-            }
-            pos = nextDivClose + 6;
-          }
-        }
-
-        if (pairEndPos === -1) {
-          pairStartIndex = pairTagStart + 1;
-          continue;
-        }
-
-        const pairContent = cellContent.substring(pairTagStart, pairEndPos);
-        if (!pairContent.trim()) {
-          pairStartIndex = pairEndPos + 6;
-          continue;
-        }
-
-        const pairData: any = {
-          pairNumber,
-          day: dayIndex,
-          dayName: weekDays[dayIndex],
-          subject: "",
-          teacher: "",
-          room: "",
-          group: "",
-          refs: { teachers: [] as Array<{ id: string; name: string }> },
-          status: "normal",
-        };
-
-        // Parse subject
-        const subjectMatch = pairContent.match(
-          /<div[^>]*class="[^"]*subject[^"]*"[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>/i
-        );
-        if (subjectMatch) pairData.subject = subjectMatch[1].trim();
-        const subjectRefMatch = pairContent.match(
-          /<div[^>]*class="[^"]*subject[^"]*"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\?cat=subject(?:&amp;|&)id=(\d+)[^"]*"[^>]*>([^<]+)<\/a>/i
-        );
-        if (subjectRefMatch?.[1]) {
-          pairData.refs.subject = { id: subjectRefMatch[1], name: subjectRefMatch[2]?.trim() || pairData.subject };
-        }
-
-        // Parse teacher
-        const teacherMatch = pairContent.match(
-          /<div[^>]*class="[^"]*teacher[^"]*"[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>/i
-        );
-        if (teacherMatch) pairData.teacher = teacherMatch[1].trim();
-        const teacherRefMatches = pairContent.matchAll(
-          /<div[^>]*class="[^"]*teacher[^"]*"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\?cat=teacher(?:&amp;|&)id=(\d+)[^"]*"[^>]*>([^<]*)<\/a>/gi
-        );
-        for (const tm of teacherRefMatches) {
-          const id = tm[1];
-          const name = (tm[2] || "").trim();
-          if (id && name) pairData.refs.teachers.push({ id, name });
-        }
-
-        // Parse room
-        const roomMatch = pairContent.match(
-          /<div[^>]*class="[^"]*place[^"]*"[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>/i
-        );
-        if (roomMatch) pairData.room = roomMatch[1].trim();
-        const placeRefMatch = pairContent.match(
-          /<div[^>]*class="[^"]*place[^"]*"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\?cat=place(?:&amp;|&)id=(\d+)[^"]*"[^>]*>([^<]+)<\/a>/i
-        );
-        if (placeRefMatch?.[1]) {
-          pairData.refs.place = { id: placeRefMatch[1], name: placeRefMatch[2]?.trim() || pairData.room };
-        }
-
-        // Parse group (shown in some timetables)
-        const groupMatch = pairContent.match(
-          /<div[^>]*class="[^"]*group[^"]*"[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>/i
-        );
-        if (groupMatch) pairData.group = groupMatch[1].trim();
-        const groupRefMatch = pairContent.match(
-          /<div[^>]*class="[^"]*group[^"]*"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\?cat=group(?:&amp;|&)id=(\d+)[^"]*"[^>]*>([^<]+)<\/a>/i
-        );
-        if (groupRefMatch?.[1]) {
-          pairData.refs.group = { id: groupRefMatch[1], name: groupRefMatch[2]?.trim() || pairData.group };
-        }
-
-        // Parse status
-        if (pairClasses.includes("added")) pairData.status = "added";
-        else if (pairClasses.includes("replaced")) pairData.status = "replaced";
-        else if (pairClasses.includes("removed")) pairData.status = "removed";
-        else if (pairClasses.includes("cancelled")) pairData.status = "cancelled";
-
-        if (pairData.subject) data.pairs.push(pairData);
-        pairStartIndex = pairEndPos + 6;
-      }
-    }
-  }
-
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/\s*-\s*Расписание КБП\s*/i, "").trim() : "";
+  const data = parseTimetableHtml(html, id, title || `${category}-${id}`);
+  data.id = id;
+  data.category = category;
+  if (title) data.title = title;
   return data;
 }
